@@ -102,6 +102,125 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)))
 		})
 
+		It("Should dynamically adjust PDB during pod deletion to prevent cascading failures (EXPECTED TO FAIL)", func() {
+			By("Step 1: Checking initial PDB configuration")
+			var initialPDB policyv1.PodDisruptionBudget
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: namespace,
+			}, &initialPDB)
+			Expect(err).To(BeNil())
+
+			// Initial PDB should allow 1 disruption (MaxUnavailable=1)
+			initialMaxUnavailable := int(initialPDB.Spec.MaxUnavailable.IntVal)
+			By(fmt.Sprintf("Initial PDB: MaxUnavailable=%d", initialMaxUnavailable))
+			Expect(initialMaxUnavailable).To(Equal(1), "Initial PDB should have MaxUnavailable=1")
+
+			By("Step 2: Finding and deleting a replica pod")
+			var pods corev1.PodList
+			err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+				resources.DragonflyNameLabelKey:    name,
+				resources.KubernetesPartOfLabelKey: "dragonfly",
+			})
+			Expect(err).To(BeNil())
+
+			var podToDelete *corev1.Pod
+			for i := range pods.Items {
+				role := pods.Items[i].Labels[resources.RoleLabelKey]
+				if role == resources.Replica {
+					podToDelete = &pods.Items[i]
+					break
+				}
+			}
+			Expect(podToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
+
+			By(fmt.Sprintf("Deleting replica pod: %s", podToDelete.Name))
+			deletedPodName := podToDelete.Name
+			err = k8sClient.Delete(ctx, podToDelete)
+			Expect(err).To(BeNil())
+
+			By("Step 3: Checking if PDB immediately increases to MaxUnavailable=2 (protection mode)")
+			// This is the KEY test - the operator SHOULD increase MaxUnavailable to 2
+			// during recovery to prevent the second pod from being deleted
+			pdbIncreased := false
+			maxPDBValue := initialMaxUnavailable
+
+			// Poll for 10 seconds to see if operator reacts quickly
+			for i := 0; i < 50; i++ {
+				var currentPDB policyv1.PodDisruptionBudget
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, &currentPDB)
+				if err == nil {
+					currentMaxUnavailable := int(currentPDB.Spec.MaxUnavailable.IntVal)
+					if currentMaxUnavailable > maxPDBValue {
+						maxPDBValue = currentMaxUnavailable
+					}
+					if currentMaxUnavailable >= 2 {
+						pdbIncreased = true
+						By(fmt.Sprintf("PDB increased to MaxUnavailable=%d (protection mode activated)", currentMaxUnavailable))
+						break
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+
+			if !pdbIncreased {
+				By(fmt.Sprintf("EXPECTED FAILURE: PDB remained at MaxUnavailable=%d (never increased to 2)", maxPDBValue))
+				By("This means the operator does NOT proactively protect against cascading failures during pod recovery")
+				By("RECOMMENDATION: Operator should temporarily increase PDB during pod recovery to prevent race condition")
+			}
+
+			// We EXPECT this to fail currently
+			Expect(pdbIncreased).To(BeTrue(), "PDB should increase to MaxUnavailable=2 during recovery to prevent cascading failures")
+
+			By("Step 4: Waiting for pod to be recreated and replication to stabilize")
+			Eventually(func() bool {
+				var pods corev1.PodList
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				})
+				if err != nil {
+					return false
+				}
+
+				// Check if we have a new pod (different from deleted one) that's ready with a role
+				readyWithRole := 0
+				for _, pod := range pods.Items {
+					if pod.Name == deletedPodName {
+						continue // Skip the deleted pod
+					}
+					role, hasRole := pod.Labels[resources.RoleLabelKey]
+					if hasRole && (role == resources.Master || role == resources.Replica) {
+						for _, cond := range pod.Status.Conditions {
+							if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+								readyWithRole++
+								break
+							}
+						}
+					}
+				}
+				return readyWithRole >= replicas
+			}, 60*time.Second, 2*time.Second).Should(BeTrue(), "Should have all pods ready with roles")
+
+			By("Step 5: Verifying PDB returns to MaxUnavailable=1 (normal mode)")
+			Eventually(func() int {
+				var finalPDB policyv1.PodDisruptionBudget
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, &finalPDB)
+				if err != nil {
+					return -1
+				}
+				return int(finalPDB.Spec.MaxUnavailable.IntVal)
+			}, 30*time.Second, 2*time.Second).Should(Equal(1), "PDB should return to MaxUnavailable=1 after recovery")
+
+			By("PDB returned to normal mode (MaxUnavailable=1) after recovery")
+		})
+
 		It("Should write test data to master that needs replication", func() {
 			By("Connecting to master via port-forward")
 			stopChan := make(chan struct{}, 1)
