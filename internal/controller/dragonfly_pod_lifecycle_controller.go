@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,17 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	podReady, readinessErr := dfi.isPodReady(ctx, &pod)
 	if readinessErr != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to verify pod readiness: %w", readinessErr)
+	}
+
+	// Reconcile PDB to adjust protection based on pod states
+	// This ensures PDB is updated whenever pod lifecycle events occur
+	needsProtection := false
+	if err := dfi.reconcilePDB(ctx); err != nil {
+		log.Error(err, "failed to reconcile PDB during pod lifecycle event")
+		// Don't fail the reconciliation - PDB update is defensive, not critical
+	} else {
+		// Check if we're in protection mode and should requeue to check again
+		needsProtection, _ = dfi.needsPDBProtection(ctx)
 	}
 
 	master, err := dfi.getMaster(ctx)
@@ -131,6 +143,12 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
+	}
+
+	// If we're in protection mode, requeue quickly to check if we can exit protection mode
+	if needsProtection {
+		log.V(1).Info("requeuing to check PDB protection status", "after", "2s")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil

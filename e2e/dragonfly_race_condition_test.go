@@ -28,6 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,11 +36,41 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// getKeyCountFromInfo extracts the number of keys from INFO keyspace output
+// Expected format: "db0:keys=69453,expires=0,..."
+func getKeyCountFromInfo(ctx context.Context, rc *redis.Client) (int, error) {
+	info, err := rc.Info(ctx, "keyspace").Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get keyspace info: %w", err)
+	}
+
+	// Parse the keyspace info to extract key count
+	// Format: db0:keys=69453,expires=0,...
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "db0:keys=") {
+			parts := strings.Split(line, ",")
+			if len(parts) > 0 {
+				keysPart := strings.TrimPrefix(parts[0], "db0:keys=")
+				var keyCount int
+				_, err := fmt.Sscanf(keysPart, "%d", &keyCount)
+				if err != nil {
+					return 0, fmt.Errorf("failed to parse key count from '%s': %w", keysPart, err)
+				}
+				return keyCount, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("no db0 keyspace found in INFO output")
+}
+
 var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempts(3), func() {
 	ctx := context.Background()
 	name := "race-test"
 	namespace := "default"
-	replicas := 2 // Minimal setup: 1 master + 1 replica
+	replicas := 2              // Minimal setup: 1 master + 1 replica
+	expectedKeyCount := 100000 // Number of keys we write in the test
 
 	df := dfv1alpha1.Dragonfly{
 		ObjectMeta: metav1.ObjectMeta{
@@ -50,8 +81,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Replicas: int32(replicas),
 		},
 	}
-
-	var replicaPodName string
 
 	Context("Testing race condition when pod is ready but lacks role", func() {
 		It("Should create Dragonfly with 2 replicas", func() {
@@ -84,64 +113,107 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 					masterCount++
 				} else if role == resources.Replica {
 					replicaCount++
-					replicaPodName = pod.Name
 				}
 			}
 			Expect(masterCount).To(Equal(1), "Should have exactly 1 master")
 			Expect(replicaCount).To(Equal(1), "Should have exactly 1 replica")
 		})
 
-		It("Should have PDB configured with MaxUnavailable=1", func() {
-			var pdb policyv1.PodDisruptionBudget
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      name,
-				Namespace: namespace,
-			}, &pdb)
-			Expect(err).To(BeNil())
-			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
-			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)))
+		It("Should have PDB configured with MaxUnavailable=1 after system stabilizes", func() {
+			// The system starts with PDB potentially at MaxUnavailable=2 during initial setup
+			// as replicas establish replication. Wait for system to fully stabilize.
+			Eventually(func() int32 {
+				var pdb policyv1.PodDisruptionBudget
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, &pdb)
+				if err != nil {
+					return -1
+				}
+				return pdb.Spec.MaxUnavailable.IntVal
+			}, 30*time.Second, 1*time.Second).Should(Equal(int32(1)), "PDB should be MaxUnavailable=1 when system is stable")
 		})
 
-		It("Should dynamically adjust PDB during pod deletion to prevent cascading failures (EXPECTED TO FAIL)", func() {
-			By("Step 1: Checking initial PDB configuration")
+		It("Should write test data to master that needs replication", func() {
+			By("Connecting to master via port-forward")
+			stopChan := make(chan struct{}, 1)
+			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, "", 6391)
+			Expect(err).To(BeNil())
+			defer close(stopChan)
+			defer rc.Close()
+
+			By("Writing test data to master")
+			// Write multiple keys to ensure there's real data to replicate
+			timestamp := time.Now().Unix()
+			for i := 0; i < expectedKeyCount; i++ {
+				key := fmt.Sprintf("test-key-%d", i)
+				value := fmt.Sprintf("test-value-%d-timestamp-%d", i, timestamp)
+				err := rc.Set(ctx, key, value, 0).Err()
+				Expect(err).To(BeNil())
+			}
+
+			By(fmt.Sprintf("Data successfully written: %d keys", expectedKeyCount))
+		})
+
+		It("Should dynamically adjust PDB during pod deletion to prevent cascading failures", func() {
+			By("Step 1: Ensuring system is stable before test (MaxUnavailable=1)")
+			// Wait for system to be in normal mode before starting the test
+			Eventually(func() int {
+				var pdb policyv1.PodDisruptionBudget
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, &pdb)
+				if err != nil {
+					return -1
+				}
+				return int(pdb.Spec.MaxUnavailable.IntVal)
+			}, 30*time.Second, 1*time.Second).Should(Equal(1), "System should be stable with MaxUnavailable=1 before test")
+
 			var initialPDB policyv1.PodDisruptionBudget
 			err := k8sClient.Get(ctx, types.NamespacedName{
 				Name:      name,
 				Namespace: namespace,
 			}, &initialPDB)
 			Expect(err).To(BeNil())
-
-			// Initial PDB should allow 1 disruption (MaxUnavailable=1)
 			initialMaxUnavailable := int(initialPDB.Spec.MaxUnavailable.IntVal)
-			By(fmt.Sprintf("Initial PDB: MaxUnavailable=%d", initialMaxUnavailable))
-			Expect(initialMaxUnavailable).To(Equal(1), "Initial PDB should have MaxUnavailable=1")
+			By(fmt.Sprintf("Initial PDB confirmed: MaxUnavailable=%d", initialMaxUnavailable))
 
-			By("Step 2: Finding and deleting a replica pod")
-			var pods corev1.PodList
-			err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-				resources.DragonflyNameLabelKey:    name,
-				resources.KubernetesPartOfLabelKey: "dragonfly",
-			})
-			Expect(err).To(BeNil())
-
+			By("Step 2: Finding and deleting a replica pod (wait for role to be assigned)")
 			var podToDelete *corev1.Pod
-			for i := range pods.Items {
-				role := pods.Items[i].Labels[resources.RoleLabelKey]
-				if role == resources.Replica {
-					podToDelete = &pods.Items[i]
-					break
+
+			// Wait for a replica pod to exist with role label assigned
+			// After previous test or between retries, pods may be reconciling
+			Eventually(func() bool {
+				var pods corev1.PodList
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				})
+				if err != nil {
+					return false
 				}
-			}
-			Expect(podToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
+
+				By(fmt.Sprintf("Found %d dragonfly pods", len(pods.Items)))
+				for i := range pods.Items {
+					role := pods.Items[i].Labels[resources.RoleLabelKey]
+					By(fmt.Sprintf("Pod %s has role=%s", pods.Items[i].Name, role))
+					if role == resources.Replica {
+						podToDelete = &pods.Items[i]
+						return true
+					}
+				}
+				return false
+			}, 30*time.Second, 1*time.Second).Should(BeTrue(), "Should eventually have a replica pod with role label")
+
+			Expect(podToDelete).NotTo(BeNil(), "Should have found a replica pod to delete")
 
 			By(fmt.Sprintf("Deleting replica pod: %s", podToDelete.Name))
-			deletedPodName := podToDelete.Name
 			err = k8sClient.Delete(ctx, podToDelete)
 			Expect(err).To(BeNil())
 
 			By("Step 3: Checking if PDB immediately increases to MaxUnavailable=2 (protection mode)")
-			// This is the KEY test - the operator SHOULD increase MaxUnavailable to 2
-			// during recovery to prevent the second pod from being deleted
 			pdbIncreased := false
 			maxPDBValue := initialMaxUnavailable
 
@@ -166,12 +238,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				time.Sleep(200 * time.Millisecond)
 			}
 
-			if !pdbIncreased {
-				By(fmt.Sprintf("EXPECTED FAILURE: PDB remained at MaxUnavailable=%d (never increased to 2)", maxPDBValue))
-				By("This means the operator does NOT proactively protect against cascading failures during pod recovery")
-				By("RECOMMENDATION: Operator should temporarily increase PDB during pod recovery to prevent race condition")
-			}
-
 			// We EXPECT this to fail currently
 			Expect(pdbIncreased).To(BeTrue(), "PDB should increase to MaxUnavailable=2 during recovery to prevent cascading failures")
 
@@ -186,12 +252,14 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 					return false
 				}
 
-				// Check if we have a new pod (different from deleted one) that's ready with a role
+				// Check if we have N pods that are ready with roles (not terminating)
 				readyWithRole := 0
 				for _, pod := range pods.Items {
-					if pod.Name == deletedPodName {
-						continue // Skip the deleted pod
+					// Skip terminating pods
+					if pod.DeletionTimestamp != nil {
+						continue
 					}
+
 					role, hasRole := pod.Labels[resources.RoleLabelKey]
 					if hasRole && (role == resources.Master || role == resources.Replica) {
 						for _, cond := range pod.Status.Conditions {
@@ -217,173 +285,62 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				}
 				return int(finalPDB.Spec.MaxUnavailable.IntVal)
 			}, 30*time.Second, 2*time.Second).Should(Equal(1), "PDB should return to MaxUnavailable=1 after recovery")
-
-			By("PDB returned to normal mode (MaxUnavailable=1) after recovery")
-		})
-
-		It("Should write test data to master that needs replication", func() {
-			By("Connecting to master via port-forward")
-			stopChan := make(chan struct{}, 1)
-			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, "", 6391)
-			Expect(err).To(BeNil())
-			defer close(stopChan)
-			defer rc.Close()
-
-			By("Writing test data to master")
-			// Write multiple keys to ensure there's real data to replicate
-			for i := 0; i < 500000; i++ {
-				key := fmt.Sprintf("test-key-%d", i)
-				value := fmt.Sprintf("test-value-%d-timestamp-%d", i, time.Now().Unix())
-				err := rc.Set(ctx, key, value, 0).Err()
-				Expect(err).To(BeNil())
-			}
-
-			By("Verifying data was written")
-			val, err := rc.Get(ctx, "test-key-0").Result()
-			Expect(err).To(BeNil())
-			Expect(val).To(ContainSubstring("test-value-0"))
-
-			By("Data successfully written - ready for replication test")
-		})
-
-		It("Should detect the race condition window when replica is deleted", func() {
-			// Delete the replica pod
-			var replicaPod corev1.Pod
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: namespace,
-				Name:      replicaPodName,
-			}, &replicaPod)
-			Expect(err).To(BeNil())
-
-			By(fmt.Sprintf("Deleting replica pod: %s", replicaPodName))
-			err = k8sClient.Delete(ctx, &replicaPod)
-			Expect(err).To(BeNil())
-
-			// Poll rapidly to catch the race condition window
-			// The window is when: pod is Ready=True but role label is missing
-			raceWindowDetected := false
-			podReadyWithoutRole := false
-			var raceConditionPod string
-
-			// Track pods that have achieved stable state (ready + have role)
-			stablePodsWithRole := make(map[string]bool)
-
-			By("Polling for race condition window (pod ready but no role)")
-			// Poll every 100ms for up to 30 seconds
-			for i := 0; i < 300; i++ {
-				var pods corev1.PodList
-				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-					resources.DragonflyNameLabelKey:    name,
-					resources.KubernetesPartOfLabelKey: "dragonfly",
-				})
-
-				for _, pod := range pods.Items {
-					// Check if pod is Running and Ready
-					if pod.Status.Phase != corev1.PodRunning {
-						continue
-					}
-
-					podReady := false
-					for _, condition := range pod.Status.Conditions {
-						if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-							podReady = true
-							break
-						}
-					}
-
-					if !podReady {
-						continue
-					}
-
-					// Check if pod has container ready
-					containerReady := false
-					for _, cs := range pod.Status.ContainerStatuses {
-						if cs.Name == resources.DragonflyContainerName && cs.Ready {
-							containerReady = true
-							break
-						}
-					}
-
-					if !containerReady {
-						continue
-					}
-
-					// Pod is ready! Now check if it has a role
-					roleValue, hasRole := pod.Labels[resources.RoleLabelKey]
-
-					if hasRole {
-						// Pod is stable: ready AND has a role
-						if roleValue == resources.Master || roleValue == resources.Replica {
-							if !stablePodsWithRole[pod.Name] {
-								stablePodsWithRole[pod.Name] = true
-								By(fmt.Sprintf("✓ Pod %s is stable (ready + role=%s). Total stable: %d/%d",
-									pod.Name, roleValue, len(stablePodsWithRole), replicas))
-							}
-						}
-					} else {
-						// CRITICAL: Pod is Ready but doesn't have role label yet!
-						if !raceWindowDetected {
-							raceWindowDetected = true
-							podReadyWithoutRole = true
-							raceConditionPod = pod.Name
-							By(fmt.Sprintf("🔴 RACE WINDOW DETECTED: Pod %s is Ready=True but has NO role label!", pod.Name))
-
-							// At this moment, check what PDB thinks
-							var pdb policyv1.PodDisruptionBudget
-							err := k8sClient.Get(ctx, types.NamespacedName{
-								Name:      name,
-								Namespace: namespace,
-							}, &pdb)
-							if err == nil {
-								By(fmt.Sprintf("PDB Status: DisruptionsAllowed=%d, CurrentHealthy=%d, DesiredHealthy=%d, ExpectedPods=%d",
-									pdb.Status.DisruptionsAllowed,
-									pdb.Status.CurrentHealthy,
-									pdb.Status.DesiredHealthy,
-									pdb.Status.ExpectedPods))
-
-								// This is the critical insight: if PDB sees 2 healthy pods
-								// (the old master + this new pod without a role), it might
-								// allow a disruption that could take down the master!
-								if pdb.Status.DisruptionsAllowed > 0 {
-									By(fmt.Sprintf("⚠️  VULNERABILITY: PDB would allow disruption of another pod! Master could be deleted!"))
-								}
-							}
-						}
-					}
-				}
-
-				// Early termination: if N=replicas pods are stable (ready + have role),
-				// the system has stabilized and we won't see the race condition anymore
-				if len(stablePodsWithRole) >= replicas {
-					By(fmt.Sprintf("✅ Early termination: %d/%d pods are stable (ready + have role). System has stabilized.",
-						len(stablePodsWithRole), replicas))
-					break
-				}
-
-				time.Sleep(25 * time.Millisecond)
-			}
-
-			if raceWindowDetected {
-				By(fmt.Sprintf("✅ Race window was detected for pod: %s", raceConditionPod))
-				By("This confirms the timing vulnerability exists!")
-			} else {
-				By("⚠️  Race window was NOT detected in this test run")
-				By("This could mean: 1) operator is very fast, 2) timing was unlucky, or 3) operator fixed the issue")
-			}
-
-			By(fmt.Sprintf("Final: %d pods achieved stable state (ready + role)", len(stablePodsWithRole)))
-
-			// We expect to see this at least sometimes with FlakeAttempts
-			// For now, just log what we found rather than failing the test
-			// In production, we'd want this to NOT happen
-			GinkgoWriter.Printf("Race condition detected: %v\n", podReadyWithoutRole)
-			GinkgoWriter.Printf("Stable pods count: %d/%d\n", len(stablePodsWithRole), replicas)
 		})
 
 		It("Should verify data integrity and replication after recovery", func() {
-			By("Finding the replica pod")
+			By("Step 1: Finding and deleting a replica pod to trigger recovery")
 			var pods corev1.PodList
 			err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+				resources.DragonflyNameLabelKey:    name,
+				resources.KubernetesPartOfLabelKey: "dragonfly",
+			})
+			Expect(err).To(BeNil())
+
+			var replicaToDelete *corev1.Pod
+			for i := range pods.Items {
+				role := pods.Items[i].Labels[resources.RoleLabelKey]
+				if role == resources.Replica {
+					replicaToDelete = &pods.Items[i]
+					break
+				}
+			}
+			Expect(replicaToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
+
+			By(fmt.Sprintf("Deleting replica pod: %s", replicaToDelete.Name))
+			err = k8sClient.Delete(ctx, replicaToDelete)
+			Expect(err).To(BeNil())
+
+			By("Step 2: Waiting for pod to be recreated and stable")
+			Eventually(func() bool {
+				var pods corev1.PodList
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				})
+				if err != nil {
+					return false
+				}
+
+				readyWithRole := 0
+				for _, pod := range pods.Items {
+					if pod.DeletionTimestamp != nil {
+						continue
+					}
+					role, hasRole := pod.Labels[resources.RoleLabelKey]
+					if hasRole && (role == resources.Master || role == resources.Replica) {
+						for _, cond := range pod.Status.Conditions {
+							if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+								readyWithRole++
+								break
+							}
+						}
+					}
+				}
+				return readyWithRole >= replicas
+			}, 60*time.Second, 2*time.Second).Should(BeTrue(), "Should have all pods ready with roles after recovery")
+
+			By("Step 3: Finding the recovered replica pod")
+			err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
 				resources.DragonflyNameLabelKey:    name,
 				resources.KubernetesPartOfLabelKey: "dragonfly",
 			})
@@ -401,7 +358,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
 			Expect(replicaPod).NotTo(BeNil(), "Should have a replica pod")
 
-			By("Connecting to master after recovery")
 			stopChan := make(chan struct{}, 1)
 			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, "", 6391)
 			Expect(err).To(BeNil())
@@ -409,29 +365,16 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			defer rc.Close()
 
 			By("Verifying original data is still present on master")
-			// Count all keys to ensure data persisted through the failover
+			// Check key count using INFO keyspace
 			replicationCheckStartTime := time.Now()
-			masterKeyCount := 0
-			for i := 0; i < 100; i++ {
-				key := fmt.Sprintf("test-key-%d", i)
-				val, err := rc.Get(ctx, key).Result()
-				if err == nil && strings.Contains(val, fmt.Sprintf("test-value-%d", i)) {
-					masterKeyCount++
-				}
-			}
-			By(fmt.Sprintf("Master has %d/100 test keys", masterKeyCount))
-			Expect(masterKeyCount).To(Equal(100), "Master should have all 100 test keys")
+			masterKeyCount, err := getKeyCountFromInfo(ctx, rc)
+			Expect(err).To(BeNil())
+			By(fmt.Sprintf("Master has %d keys (expected %d)", masterKeyCount, expectedKeyCount))
+			Expect(masterKeyCount).To(Equal(expectedKeyCount), fmt.Sprintf("Master should have all %d test keys", expectedKeyCount))
 
 			By("Checking master replication status (with retry for replica reconnection)")
 			// After pod recovery, replica may need time to reconnect to master
-			Eventually(func() (string, error) {
-				info, err := rc.Info(ctx, "replication").Result()
-				if err != nil {
-					return "", err
-				}
-				By(fmt.Sprintf("Master replication info (attempt):\n%s", info))
-				return info, nil
-			}, 60*time.Second, 2*time.Second).Should(And(
+			Eventually(rc.Info(ctx, "replication"), 60*time.Second, 2*time.Second).Should(And(
 				ContainSubstring("role:master"),
 				ContainSubstring("connected_slaves:1"),
 			), "Master should have 1 connected replica within 60 seconds")
@@ -470,37 +413,27 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				DialTimeout:  15 * time.Second,
 				ReadTimeout:  10 * time.Second,
 				WriteTimeout: 10 * time.Second,
+				MaintNotificationsConfig: &maintnotifications.Config{
+					Mode: maintnotifications.ModeDisabled,
+				},
 			})
 			defer replicaClient.Close()
 
 			// Verify the replica has the test data we wrote earlier
-			By("Counting replicated keys on replica")
-			replicaKeyCount := 0
-			for i := 0; i < 100; i++ {
-				key := fmt.Sprintf("test-key-%d", i)
-				val, err := replicaClient.Get(ctx, key).Result()
-				if err == nil && strings.Contains(val, fmt.Sprintf("test-value-%d", i)) {
-					replicaKeyCount++
-				}
-			}
-			By(fmt.Sprintf("Replica has %d/100 test keys", replicaKeyCount))
-			Expect(replicaKeyCount).To(Equal(100), "Replica should have all 100 test keys replicated from master")
+			By("Checking replicated key count on replica using INFO keyspace")
+			replicaKeyCount, err := getKeyCountFromInfo(ctx, replicaClient)
+			Expect(err).To(BeNil())
+			By(fmt.Sprintf("Replica has %d keys (expected %d)", replicaKeyCount, expectedKeyCount))
+			Expect(replicaKeyCount).To(Equal(expectedKeyCount), fmt.Sprintf("Replica should have all %d test keys replicated from master", expectedKeyCount))
 
 			By("Checking replica's replication status (with retry)")
 			// Replica may need time to establish connection to master
-			Eventually(func() (string, error) {
-				info, err := replicaClient.Info(ctx, "replication").Result()
-				if err != nil {
-					return "", err
-				}
-				By(fmt.Sprintf("Replica replication info (attempt):\n%s", info))
-				return info, nil
-			}, 60*time.Second, 2*time.Second).Should(And(
-				ContainSubstring("role:replica"),
+			Eventually(replicaClient.Info(ctx, "replication"), 60*time.Second, 2*time.Second).Should(And(
 				Or(
-					ContainSubstring("master_link_status:up"),
-					ContainSubstring("master_sync_in_progress:0"),
+					ContainSubstring("role:slave"), // DragonflyDB uses "slave" for Redis compatibility
+					ContainSubstring("role:replica"),
 				),
+				ContainSubstring("master_link_status:up"),
 			), "Replica should connect to master within 60 seconds")
 
 			By("Writing new data to master to verify live replication")
@@ -510,12 +443,10 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(err).To(BeNil())
 
 			// Verify new data appears on replica (give replication a moment)
-			Eventually(func() (string, error) {
-				return replicaClient.Get(ctx, testKey).Result()
-			}, 5*time.Second, 500*time.Millisecond).Should(Equal(testValue), "New data should replicate to replica")
+			Eventually(replicaClient.Get(ctx, testKey), 5*time.Second, 500*time.Millisecond).Should(Equal(testValue), "New data should replicate to replica")
 
 			recoveryDuration := time.Since(replicationCheckStartTime)
-			By(fmt.Sprintf("✅ Data integrity and replication verified: 100/100 keys on both master and replica, live replication working"))
+			By(fmt.Sprintf("✅ Data integrity and replication verified: %d keys on both master and replica, live replication working", expectedKeyCount))
 			By(fmt.Sprintf("⏱️  Total recovery and stabilization time: %.2f seconds", recoveryDuration.Seconds()))
 		})
 
