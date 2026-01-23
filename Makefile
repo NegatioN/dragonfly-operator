@@ -61,6 +61,21 @@ test: manifests generate fmt vet envtest ## Run tests.
 	GOBIN=$(LOCALBIN) go install github.com/onsi/ginkgo/v2/ginkgo@v2.27.1
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GINKGO) -timeout=12m -vv -r -p -coverprofile cover.out
 
+.PHONY: test-e2e-pod-lifecycle
+test-e2e-pod-lifecycle: ## Run only the pod lifecycle e2e tests (requires operator deployed to real k8s cluster)
+	GOBIN=$(LOCALBIN) go install github.com/onsi/ginkgo/v2/ginkgo@v2.27.1
+	$(GINKGO) -v --focus-file=dragonfly_pod_lifecycle_controller_test.go ./e2e/
+
+.PHONY: test-e2e-failover
+test-e2e-failover: ## Run only the failover tests (requires operator deployed to real k8s cluster)
+	GOBIN=$(LOCALBIN) go install github.com/onsi/ginkgo/v2/ginkgo@v2.27.1
+	$(GINKGO) -v --focus="Fail Over is working" ./e2e/
+
+.PHONY: test-e2e-race
+test-e2e-race: ## Run race condition test to detect pod ready without role timing issue (requires operator deployed)
+	GOBIN=$(LOCALBIN) go install github.com/onsi/ginkgo/v2/ginkgo@v2.27.1
+	$(GINKGO) -v --focus-file=dragonfly_race_condition_test.go ./e2e/
+
 ##@ Build
 
 .PHONY: build
