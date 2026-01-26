@@ -803,7 +803,6 @@ func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, err
 		}
 	}
 
-	// CRITICAL: Check if we have insufficient redundancy (less than 2 healthy pods)
 	// Protection is only needed when we're at risk of complete outage (0 or 1 pods)
 	// With 2+ pods, we still have redundancy even during recovery
 	if readyWithRole < 2 {
