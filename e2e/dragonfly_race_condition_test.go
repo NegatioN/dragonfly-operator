@@ -31,6 +31,7 @@ import (
 	"github.com/redis/go-redis/v9/maintnotifications"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,16 +50,13 @@ func getKeyCountFromInfo(ctx context.Context, rc *redis.Client) (int, error) {
 	for _, line := range strings.Split(info, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "db0:keys=") {
-			parts := strings.Split(line, ",")
-			if len(parts) > 0 {
-				keysPart := strings.TrimPrefix(parts[0], "db0:keys=")
-				var keyCount int
-				_, err := fmt.Sscanf(keysPart, "%d", &keyCount)
-				if err != nil {
-					return 0, fmt.Errorf("failed to parse key count from '%s': %w", keysPart, err)
-				}
-				return keyCount, nil
+			keysPart := strings.TrimPrefix(strings.SplitN(line, ",", 2)[0], "db0:keys=")
+			var keyCount int
+			_, err := fmt.Sscanf(keysPart, "%d", &keyCount)
+			if err != nil {
+				return 0, fmt.Errorf("failed to parse key count from '%s': %w", keysPart, err)
 			}
+			return keyCount, nil
 		}
 	}
 
@@ -101,6 +99,18 @@ func getPDB(ctx context.Context, name, namespace string) (*policyv1.PodDisruptio
 	return &pdb, nil
 }
 
+// tryEvictPod attempts to evict a pod via the Kubernetes Eviction API.
+// Unlike a direct Delete, eviction is subject to PodDisruptionBudget enforcement:
+// when the PDB blocks it, the API returns HTTP 429 (Too Many Requests).
+func tryEvictPod(ctx context.Context, pod *corev1.Pod) error {
+	return clientset.CoreV1().Pods(pod.Namespace).EvictV1(ctx, &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+	})
+}
+
 var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempts(3), func() {
 	ctx := context.Background()
 	name := "race-test"
@@ -137,8 +147,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		})
 
 		It("Should have PDB configured with MaxUnavailable=1 after system stabilizes", func() {
-			// The system starts with PDB potentially at MaxUnavailable=2 during initial setup
-			// as replicas establish replication. Wait for system to fully stabilize.
 			Eventually(func() int32 {
 				pdb, err := getPDB(ctx, name, namespace)
 				if err != nil {
@@ -201,27 +209,37 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			err := k8sClient.Delete(ctx, podToDelete)
 			Expect(err).To(BeNil())
 
-			By("Step 3: Checking if PDB immediately increases to MaxUnavailable=2 (protection mode)")
-			pdbIncreased := false
+			By("Step 3: Checking if PDB drops to MaxUnavailable=0 (protection mode: no disruptions allowed)")
+			pdbProtected := false
 
 			// Poll for 10 seconds to see if operator reacts quickly
 			for i := 0; i < 50; i++ {
 				currentPDB, err := getPDB(ctx, name, namespace)
 				if err == nil {
 					currentMaxUnavailable := int(currentPDB.Spec.MaxUnavailable.IntVal)
-					if currentMaxUnavailable >= 2 {
-						pdbIncreased = true
-						By(fmt.Sprintf("PDB increased to MaxUnavailable=%d (protection mode activated)", currentMaxUnavailable))
+					if currentMaxUnavailable == 0 {
+						pdbProtected = true
+						By("PDB dropped to MaxUnavailable=0 (protection mode activated)")
 						break
 					}
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
 
-			Expect(pdbIncreased).To(BeTrue(), "PDB should increase to MaxUnavailable=2 during recovery to prevent cascading failures")
+			Expect(pdbProtected).To(BeTrue(), "PDB should drop to MaxUnavailable=0 during recovery to prevent cascading failures")
+
+			By("Step 3b: Attempting to evict master while PDB is in protection mode (should be rejected)")
+			// This is the core of the race condition fix: when the new replica pod is ready but
+			// has no role yet, the PDB must block any further voluntary disruption of the master.
+			masterPod, _, err := getMasterReplica(ctx, namespace, name)
+			Expect(err).To(BeNil())
+			Expect(masterPod).NotTo(BeNil(), "Master pod should still be running during recovery")
+			evictErr := tryEvictPod(ctx, masterPod)
+			Expect(apierrors.IsTooManyRequests(evictErr)).To(BeTrue(),
+				"Master eviction must be rejected (HTTP 429) by the PDB while in protection mode (MaxUnavailable=0)")
 
 			By("Step 4: Waiting for pod to be recreated and replication to stabilize")
-			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
+			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
 
 			By("Step 5: Verifying PDB returns to MaxUnavailable=1 (normal mode)")
 			Eventually(func() int {
@@ -231,22 +249,25 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				}
 				return int(finalPDB.Spec.MaxUnavailable.IntVal)
 			}, 30*time.Second, 2*time.Second).Should(Equal(1), "PDB should return to MaxUnavailable=1 after recovery")
+
+			By("Step 6: Attempting to evict master after recovery (should now be allowed by PDB=1)")
+			// Once the new replica has its role and is stable, MaxUnavailable=1 allows one voluntary
+			// disruption — proving the protection window has closed correctly.
+			masterPod, _, err = getMasterReplica(ctx, namespace, name)
+			Expect(err).To(BeNil())
+			Expect(masterPod).NotTo(BeNil(), "Master pod should exist after recovery")
+			Expect(tryEvictPod(ctx, masterPod)).To(Succeed(),
+				"Master eviction should be allowed when PDB is in normal mode (MaxUnavailable=1)")
+
+			By("Step 7: Waiting for system to recover after master eviction")
+			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
+			Expect(waitForDragonflyPhase(ctx, k8sClient, name, namespace, controller.PhaseReady, 1*time.Minute)).To(BeNil())
 		})
 
 		It("Should verify data integrity and replication after recovery", func() {
-			By("Step 1: Finding and deleting a replica pod to trigger recovery")
-			_, replicaToDelete, err := getMasterReplica(ctx, namespace, name)
-			Expect(err).To(BeNil())
-			Expect(replicaToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
-
-			By(fmt.Sprintf("Deleting replica pod: %s", replicaToDelete.Name))
-			err = k8sClient.Delete(ctx, replicaToDelete)
-			Expect(err).To(BeNil())
-
-			By("Step 2: Waiting for pod to be recreated and stable")
-			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
-
-			By("Step 3: Finding the recovered replica pod")
+			// The previous test deleted the replica, recovered, then evicted the master and
+			// recovered again. Verify that all 25000 keys are still present and replicated.
+			By("Finding the current master and replica after recovery")
 			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
 			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
@@ -403,9 +424,7 @@ var _ = Describe("PDB Stability: 3 Replicas", Ordered, FlakeAttempts(3), func() 
 	Context("Testing that PDB remains stable with 3 replicas", func() {
 		It("Should create dragonfly instance with 3 replicas", func() {
 			Expect(k8sClient.Create(ctx, &df)).To(Succeed())
-
-			// Wait for StatefulSet to be ready
-			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
+			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
 		})
 
 		It("Should have PDB configured with MaxUnavailable=1 when stable", func() {
@@ -445,7 +464,7 @@ var _ = Describe("PDB Stability: 3 Replicas", Ordered, FlakeAttempts(3), func() 
 			}, 10*time.Second, 500*time.Millisecond).Should(Equal(int32(1)), "PDB should remain at MaxUnavailable=1 (sufficient redundancy)")
 
 			By("Step 4: Waiting for pod to be recreated and system to stabilize")
-			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
+			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
 
 			By("Step 5: Confirming PDB is still MaxUnavailable=1 after recovery")
 			finalPDB, err := getPDB(ctx, name, namespace)

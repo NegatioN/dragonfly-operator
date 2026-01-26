@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -755,8 +756,9 @@ func (dfi *DragonflyInstance) isPodReady(ctx context.Context, pod *corev1.Pod) (
 	return loaded, nil
 }
 
-// needsPDBProtection determines if the system needs increased PDB protection
-// Protection is needed when pods are ready but lack role assignment or aren't fully stable
+// needsPDBProtection determines if the system needs PDB protection (MaxUnavailable=0).
+// Protection is needed when fewer than 2 pods are ready with an assigned role,
+// meaning we cannot afford any voluntary disruption without risking complete outage.
 func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, error) {
 	pods, err := dfi.getPods(ctx)
 	if err != nil {
@@ -774,37 +776,16 @@ func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, err
 			continue
 		}
 
-		// Check if pod is ready but lacks role label
+		// Only count pods that are running, ready, and have a role assigned
 		if isRunningAndReady(pod) {
-			if _, hasRole := pod.Labels[resources.RoleLabelKey]; !hasRole {
-				// Pod is ready but doesn't have a role yet - VULNERABLE STATE
-				dfi.log.Info("PDB protection needed: pod ready without role", "pod", pod.Name)
-				return true, nil
-			}
-
-			// Pod has role - count it
-			readyWithRole++
-
-			// Check if replica is stable (only for replicas)
-			role := pod.Labels[resources.RoleLabelKey]
-			if role == resources.Replica {
-				stable, err := dfi.isReplicaStable(ctx, pod)
-				if err != nil {
-					// Can't determine stability, assume it needs protection
-					dfi.log.V(1).Info("PDB protection needed: failed to check replica stability", "pod", pod.Name, "error", err)
-					return true, nil
-				}
-				if !stable {
-					// Replica exists but isn't stable yet
-					dfi.log.Info("PDB protection needed: unstable replica", "pod", pod.Name)
-					return true, nil
-				}
+			if _, hasRole := pod.Labels[resources.RoleLabelKey]; hasRole {
+				readyWithRole++
 			}
 		}
 	}
 
-	// Protection is only needed when we're at risk of complete outage (0 or 1 pods)
-	// With 2+ pods, we still have redundancy even during recovery
+	// Protect when fewer than 2 pods are ready with a role: losing any further pod
+	// risks a complete outage.
 	if readyWithRole < 2 {
 		dfi.log.Info("PDB protection needed: insufficient redundancy",
 			"readyWithRole", readyWithRole, "expected", expectedReplicas)
@@ -814,22 +795,25 @@ func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, err
 	return false, nil
 }
 
-// reconcilePDB updates the PodDisruptionBudget based on current pod states
-func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) error {
+// reconcilePDB updates the PodDisruptionBudget based on current pod states.
+// It returns true if protection mode is active (MaxUnavailable=0).
+func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) (bool, error) {
 	// Only manage PDB for multi-replica setups
 	if dfi.df.Spec.Replicas < 2 {
-		return nil
+		return false, nil
 	}
 
 	needsProtection, err := dfi.needsPDBProtection(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to determine PDB protection needs: %w", err)
+		return false, fmt.Errorf("failed to determine PDB protection needs: %w", err)
 	}
 
-	// Calculate desired MaxUnavailable
-	desiredMaxUnavailable := int32(1) // Normal mode
+	// Calculate desired MaxUnavailable:
+	// - Normal mode: 1 (allow one voluntary disruption)
+	// - Protection mode: 0 (no voluntary disruptions until 2+ pods have roles)
+	desiredMaxUnavailable := int32(1)
 	if needsProtection {
-		desiredMaxUnavailable = 2 // Protection mode
+		desiredMaxUnavailable = 0
 	}
 
 	// Get current PDB
@@ -841,21 +825,26 @@ func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) error {
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// PDB doesn't exist yet, it will be created by reconcileResources
-			return nil
+			return needsProtection, nil
 		}
-		return fmt.Errorf("failed to get PDB: %w", err)
+		return false, fmt.Errorf("failed to get PDB: %w", err)
+	}
+
+	// Initialise MaxUnavailable if nil (e.g. PDB was created with MinAvailable or externally modified)
+	if pdb.Spec.MaxUnavailable == nil {
+		pdb.Spec.MaxUnavailable = &intstr.IntOrString{}
 	}
 
 	// Check if update is needed
 	currentMaxUnavailable := pdb.Spec.MaxUnavailable.IntVal
 	if currentMaxUnavailable == desiredMaxUnavailable {
-		return nil // Already at desired value
+		return needsProtection, nil // Already at desired value
 	}
 
 	// Update PDB
 	pdb.Spec.MaxUnavailable.IntVal = desiredMaxUnavailable
 	if err = dfi.client.Update(ctx, &pdb); err != nil {
-		return fmt.Errorf("failed to update PDB: %w", err)
+		return false, fmt.Errorf("failed to update PDB: %w", err)
 	}
 
 	mode := "normal"
@@ -866,7 +855,7 @@ func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) error {
 	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "PDBUpdate",
 		fmt.Sprintf("Updated PDB to MaxUnavailable=%d (%s mode)", desiredMaxUnavailable, mode))
 
-	return nil
+	return needsProtection, nil
 }
 
 // detectRollingUpdate checks whether the pod spec has changed and performs a rolling update if needed

@@ -71,11 +71,9 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Reconcile PDB to ensure protection during pod lifecycle changes
 	// This provides a safety net in case pod lifecycle events are delayed
-	if dfi.df.Spec.Replicas > 1 {
-		if err = dfi.reconcilePDB(ctx); err != nil {
-			log.Error(err, "failed to reconcile PDB in main reconciler")
-			// Don't fail - PDB is defensive
-		}
+	if _, err = dfi.reconcilePDB(ctx); err != nil {
+		log.Error(err, "failed to reconcile PDB in main reconciler")
+		// Don't fail - PDB is defensive
 	}
 
 	dfiStatus := dfi.getStatus()

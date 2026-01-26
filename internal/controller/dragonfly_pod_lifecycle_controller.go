@@ -76,13 +76,10 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Reconcile PDB to adjust protection based on pod states
 	// This ensures PDB is updated whenever pod lifecycle events occur
-	needsProtection := false
-	if err := dfi.reconcilePDB(ctx); err != nil {
-		log.Error(err, "failed to reconcile PDB during pod lifecycle event")
+	needsProtection, pdbErr := dfi.reconcilePDB(ctx)
+	if pdbErr != nil {
+		log.Error(pdbErr, "failed to reconcile PDB during pod lifecycle event")
 		// Don't fail the reconciliation - PDB update is defensive, not critical
-	} else {
-		// Check if we're in protection mode and should requeue to check again
-		needsProtection, _ = dfi.needsPDBProtection(ctx)
 	}
 
 	master, err := dfi.getMaster(ctx)
