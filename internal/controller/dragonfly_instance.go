@@ -803,10 +803,11 @@ func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, err
 		}
 	}
 
-	// CRITICAL: Check if we have fewer ready+role pods than expected
-	// This catches the case where a pod was deleted and hasn't been recreated/stabilized yet
-	if readyWithRole < expectedReplicas {
-		dfi.log.Info("PDB protection needed: fewer ready pods than expected",
+	// CRITICAL: Check if we have insufficient redundancy (less than 2 healthy pods)
+	// Protection is only needed when we're at risk of complete outage (0 or 1 pods)
+	// With 2+ pods, we still have redundancy even during recovery
+	if readyWithRole < 2 {
+		dfi.log.Info("PDB protection needed: insufficient redundancy",
 			"readyWithRole", readyWithRole, "expected", expectedReplicas)
 		return true, nil
 	}

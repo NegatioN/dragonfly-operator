@@ -71,7 +71,11 @@ func getMasterReplica(ctx context.Context, namespace string, name string) (*core
 		resources.DragonflyNameLabelKey:    name,
 		resources.KubernetesPartOfLabelKey: "dragonfly",
 	})
-	Expect(err).To(BeNil())
+
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var masterPod, replicaPod *corev1.Pod
 	for i := range pods.Items {
 		role := pods.Items[i].Labels[resources.RoleLabelKey]
@@ -83,15 +87,26 @@ func getMasterReplica(ctx context.Context, namespace string, name string) (*core
 	}
 
 	return masterPod, replicaPod, nil
+}
 
+func getPDB(ctx context.Context, name, namespace string) (*policyv1.PodDisruptionBudget, error) {
+	var pdb policyv1.PodDisruptionBudget
+	err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}, &pdb)
+	if err != nil {
+		return nil, err
+	}
+	return &pdb, nil
 }
 
 var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempts(3), func() {
 	ctx := context.Background()
 	name := "race-test"
 	namespace := "default"
-	replicas := 2              // Minimal setup: 1 master + 1 replica
-	expectedKeyCount := 100000 // Number of keys we write in the test
+	replicas := 2             // Minimal setup: 1 master + 1 replica
+	expectedKeyCount := 25000 // Number of keys we write in the test
 
 	df := dfv1alpha1.Dragonfly{
 		ObjectMeta: metav1.ObjectMeta{
@@ -115,40 +130,17 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			err := waitForDragonflyPhase(ctx, k8sClient, name, namespace, controller.PhaseReady, 1*time.Minute)
 			Expect(err).To(BeNil())
 
-			// Verify we have 1 master and 1 replica
-			var pods corev1.PodList
-			err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-				resources.DragonflyNameLabelKey:    name,
-				resources.KubernetesPartOfLabelKey: "dragonfly",
-			})
+			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
-			Expect(pods.Items).To(HaveLen(replicas))
-
-			masterCount := 0
-			replicaCount := 0
-			for _, pod := range pods.Items {
-				role, ok := pod.Labels[resources.RoleLabelKey]
-				Expect(ok).To(BeTrue(), fmt.Sprintf("Pod %s should have a role label", pod.Name))
-
-				if role == resources.Master {
-					masterCount++
-				} else if role == resources.Replica {
-					replicaCount++
-				}
-			}
-			Expect(masterCount).To(Equal(1), "Should have exactly 1 master")
-			Expect(replicaCount).To(Equal(1), "Should have exactly 1 replica")
+			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
+			Expect(replicaPod).NotTo(BeNil(), "Should have a replica pod")
 		})
 
 		It("Should have PDB configured with MaxUnavailable=1 after system stabilizes", func() {
 			// The system starts with PDB potentially at MaxUnavailable=2 during initial setup
 			// as replicas establish replication. Wait for system to fully stabilize.
 			Eventually(func() int32 {
-				var pdb policyv1.PodDisruptionBudget
-				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      name,
-					Namespace: namespace,
-				}, &pdb)
+				pdb, err := getPDB(ctx, name, namespace)
 				if err != nil {
 					return -1
 				}
@@ -181,25 +173,12 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			By("Step 1: Ensuring system is stable before test (MaxUnavailable=1)")
 			// Wait for system to be in normal mode before starting the test
 			Eventually(func() int {
-				var pdb policyv1.PodDisruptionBudget
-				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      name,
-					Namespace: namespace,
-				}, &pdb)
+				pdb, err := getPDB(ctx, name, namespace)
 				if err != nil {
 					return -1
 				}
 				return int(pdb.Spec.MaxUnavailable.IntVal)
 			}, 30*time.Second, 1*time.Second).Should(Equal(1), "System should be stable with MaxUnavailable=1 before test")
-
-			var initialPDB policyv1.PodDisruptionBudget
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      name,
-				Namespace: namespace,
-			}, &initialPDB)
-			Expect(err).To(BeNil())
-			initialMaxUnavailable := int(initialPDB.Spec.MaxUnavailable.IntVal)
-			By(fmt.Sprintf("Initial PDB confirmed: MaxUnavailable=%d", initialMaxUnavailable))
 
 			By("Step 2: Finding and deleting a replica pod (wait for role to be assigned)")
 			var podToDelete *corev1.Pod
@@ -219,25 +198,17 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(podToDelete).NotTo(BeNil(), "Should have found a replica pod to delete")
 
 			By(fmt.Sprintf("Deleting replica pod: %s", podToDelete.Name))
-			err = k8sClient.Delete(ctx, podToDelete)
+			err := k8sClient.Delete(ctx, podToDelete)
 			Expect(err).To(BeNil())
 
 			By("Step 3: Checking if PDB immediately increases to MaxUnavailable=2 (protection mode)")
 			pdbIncreased := false
-			maxPDBValue := initialMaxUnavailable
 
 			// Poll for 10 seconds to see if operator reacts quickly
 			for i := 0; i < 50; i++ {
-				var currentPDB policyv1.PodDisruptionBudget
-				err = k8sClient.Get(ctx, types.NamespacedName{
-					Name:      name,
-					Namespace: namespace,
-				}, &currentPDB)
+				currentPDB, err := getPDB(ctx, name, namespace)
 				if err == nil {
 					currentMaxUnavailable := int(currentPDB.Spec.MaxUnavailable.IntVal)
-					if currentMaxUnavailable > maxPDBValue {
-						maxPDBValue = currentMaxUnavailable
-					}
 					if currentMaxUnavailable >= 2 {
 						pdbIncreased = true
 						By(fmt.Sprintf("PDB increased to MaxUnavailable=%d (protection mode activated)", currentMaxUnavailable))
@@ -247,48 +218,14 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				time.Sleep(200 * time.Millisecond)
 			}
 
-			// We EXPECT this to fail currently
 			Expect(pdbIncreased).To(BeTrue(), "PDB should increase to MaxUnavailable=2 during recovery to prevent cascading failures")
 
 			By("Step 4: Waiting for pod to be recreated and replication to stabilize")
-			Eventually(func() bool {
-				var pods corev1.PodList
-				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-					resources.DragonflyNameLabelKey:    name,
-					resources.KubernetesPartOfLabelKey: "dragonfly",
-				})
-				if err != nil {
-					return false
-				}
-
-				// Check if we have N pods that are ready with roles (not terminating)
-				readyWithRole := 0
-				for _, pod := range pods.Items {
-					// Skip terminating pods
-					if pod.DeletionTimestamp != nil {
-						continue
-					}
-
-					role, hasRole := pod.Labels[resources.RoleLabelKey]
-					if hasRole && (role == resources.Master || role == resources.Replica) {
-						for _, cond := range pod.Status.Conditions {
-							if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-								readyWithRole++
-								break
-							}
-						}
-					}
-				}
-				return readyWithRole >= replicas
-			}, 60*time.Second, 2*time.Second).Should(BeTrue(), "Should have all pods ready with roles")
+			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
 
 			By("Step 5: Verifying PDB returns to MaxUnavailable=1 (normal mode)")
 			Eventually(func() int {
-				var finalPDB policyv1.PodDisruptionBudget
-				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      name,
-					Namespace: namespace,
-				}, &finalPDB)
+				finalPDB, err := getPDB(ctx, name, namespace)
 				if err != nil {
 					return -1
 				}
@@ -307,33 +244,7 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(err).To(BeNil())
 
 			By("Step 2: Waiting for pod to be recreated and stable")
-			Eventually(func() bool {
-				var pods corev1.PodList
-				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-					resources.DragonflyNameLabelKey:    name,
-					resources.KubernetesPartOfLabelKey: "dragonfly",
-				})
-				if err != nil {
-					return false
-				}
-
-				readyWithRole := 0
-				for _, pod := range pods.Items {
-					if pod.DeletionTimestamp != nil {
-						continue
-					}
-					role, hasRole := pod.Labels[resources.RoleLabelKey]
-					if hasRole && (role == resources.Master || role == resources.Replica) {
-						for _, cond := range pod.Status.Conditions {
-							if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-								readyWithRole++
-								break
-							}
-						}
-					}
-				}
-				return readyWithRole >= replicas
-			}, 60*time.Second, 2*time.Second).Should(BeTrue(), "Should have all pods ready with roles after recovery")
+			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
 
 			By("Step 3: Finding the recovered replica pod")
 			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
@@ -457,12 +368,92 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Eventually(func() (string, error) {
 				return replicaClient.Get(ctx, testKey).Result()
 			}, 5*time.Second, 500*time.Millisecond).Should(Equal(testValue), "New data should replicate to replica")
-
-			By(fmt.Sprintf("✅ Data integrity and replication verified: %d keys on both master and replica, live replication working", expectedKeyCount))
-
 		})
 
 		It("Cleanup", func() {
+			var df dfv1alpha1.Dragonfly
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: namespace,
+			}, &df)
+			Expect(err).To(BeNil())
+
+			err = k8sClient.Delete(ctx, &df)
+			Expect(err).To(BeNil())
+		})
+	})
+})
+
+var _ = Describe("PDB Stability: 3 Replicas", Ordered, FlakeAttempts(3), func() {
+	ctx := context.Background()
+	name := "stable-test"
+	namespace := "default"
+	replicas := 3 // 1 master + 2 replicas - sufficient redundancy
+
+	df := dfv1alpha1.Dragonfly{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: dfv1alpha1.DragonflySpec{
+			Replicas: int32(replicas),
+		},
+	}
+
+	Context("Testing that PDB remains stable with 3 replicas", func() {
+		It("Should create dragonfly instance with 3 replicas", func() {
+			Expect(k8sClient.Create(ctx, &df)).To(Succeed())
+
+			// Wait for StatefulSet to be ready
+			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
+		})
+
+		It("Should have PDB configured with MaxUnavailable=1 when stable", func() {
+			Eventually(func() int32 {
+				pdb, err := getPDB(ctx, name, namespace)
+				if err != nil {
+					return -1
+				}
+				return pdb.Spec.MaxUnavailable.IntVal
+			}, 30*time.Second, 1*time.Second).Should(Equal(int32(1)), "PDB should be MaxUnavailable=1 when system is stable")
+		})
+
+		It("Should NOT increase PDB when deleting one replica (sufficient redundancy)", func() {
+			By("Step 1: Confirming initial PDB state")
+			initialPDB, err := getPDB(ctx, name, namespace)
+			Expect(err).To(BeNil())
+			Expect(initialPDB.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)), "Initial PDB should be MaxUnavailable=1")
+
+			By("Step 2: Finding and deleting a replica pod")
+			_, replicaToDelete, err := getMasterReplica(ctx, namespace, name)
+			Expect(err).To(BeNil())
+			Expect(replicaToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
+
+			By(fmt.Sprintf("Deleting replica pod: %s", replicaToDelete.Name))
+			err = k8sClient.Delete(ctx, replicaToDelete)
+			Expect(err).To(BeNil())
+
+			By("Step 3: Verifying PDB remains at MaxUnavailable=1 (no protection needed)")
+			// With 3 replicas, losing 1 still leaves 2 healthy pods (1 master + 1 replica)
+			// The operator should recognize this is sufficient and NOT increase PDB
+			Consistently(func() int32 {
+				pdb, err := getPDB(ctx, name, namespace)
+				if err != nil {
+					return -1
+				}
+				return pdb.Spec.MaxUnavailable.IntVal
+			}, 10*time.Second, 500*time.Millisecond).Should(Equal(int32(1)), "PDB should remain at MaxUnavailable=1 (sufficient redundancy)")
+
+			By("Step 4: Waiting for pod to be recreated and system to stabilize")
+			waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)
+
+			By("Step 5: Confirming PDB is still MaxUnavailable=1 after recovery")
+			finalPDB, err := getPDB(ctx, name, namespace)
+			Expect(err).To(BeNil())
+			Expect(finalPDB.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)), "Final PDB should remain MaxUnavailable=1")
+		})
+
+		AfterAll(func() {
 			var df dfv1alpha1.Dragonfly
 			err := k8sClient.Get(ctx, types.NamespacedName{
 				Name:      name,

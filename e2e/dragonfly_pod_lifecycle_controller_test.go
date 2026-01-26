@@ -125,8 +125,7 @@ var _ = Describe("DF Pod Lifecycle Reconciler", Ordered, FlakeAttempts(3), func(
 
 			// Wait until the loop is reconciled. This is needed as status is ready previously
 			// and the test might move forward even before the reconcile loop is triggered
-			//time.Sleep(1 * time.Minute)
-			//TODO could a solution be that we modify the poddisruptionbudget when a pod goes down? If a pod goes down, we make it such that the poddisruptionbudget is "2" until the second pod is fully synced and marked as replica?
+			time.Sleep(1 * time.Minute)
 
 			err := waitForStatefulSetReady(ctx, k8sClient, name, namespace, 1*time.Minute)
 			Expect(err).To(BeNil())
