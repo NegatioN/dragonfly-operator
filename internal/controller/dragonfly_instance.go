@@ -852,33 +852,10 @@ func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) error {
 		return nil // Already at desired value
 	}
 
-	// Update PDB with retry on conflict
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			// Refetch PDB to get latest version
-			if err = dfi.client.Get(ctx, types.NamespacedName{
-				Name:      dfi.df.Name,
-				Namespace: dfi.df.Namespace,
-			}, &pdb); err != nil {
-				return fmt.Errorf("failed to refetch PDB: %w", err)
-			}
-			// Check again if update is still needed
-			if pdb.Spec.MaxUnavailable.IntVal == desiredMaxUnavailable {
-				dfi.log.V(1).Info("PDB already updated by another reconciliation", "maxUnavailable", desiredMaxUnavailable)
-				return nil
-			}
-			time.Sleep(100 * time.Millisecond) // Fixed delay between retries
-		}
-
-		pdb.Spec.MaxUnavailable.IntVal = desiredMaxUnavailable
-		if err = dfi.client.Update(ctx, &pdb); err != nil {
-			if apierrors.IsConflict(err) && attempt < 2 {
-				dfi.log.V(1).Info("PDB update conflict, retrying", "attempt", attempt+1)
-				continue
-			}
-			return fmt.Errorf("failed to update PDB: %w", err)
-		}
-		break // Success
+	// Update PDB
+	pdb.Spec.MaxUnavailable.IntVal = desiredMaxUnavailable
+	if err = dfi.client.Update(ctx, &pdb); err != nil {
+		return fmt.Errorf("failed to update PDB: %w", err)
 	}
 
 	mode := "normal"

@@ -65,6 +65,27 @@ func getKeyCountFromInfo(ctx context.Context, rc *redis.Client) (int, error) {
 	return 0, fmt.Errorf("no db0 keyspace found in INFO output")
 }
 
+func getMasterReplica(ctx context.Context, namespace string, name string) (*corev1.Pod, *corev1.Pod, error) {
+	var pods corev1.PodList
+	err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+		resources.DragonflyNameLabelKey:    name,
+		resources.KubernetesPartOfLabelKey: "dragonfly",
+	})
+	Expect(err).To(BeNil())
+	var masterPod, replicaPod *corev1.Pod
+	for i := range pods.Items {
+		role := pods.Items[i].Labels[resources.RoleLabelKey]
+		if role == resources.Master {
+			masterPod = &pods.Items[i]
+		} else if role == resources.Replica {
+			replicaPod = &pods.Items[i]
+		}
+	}
+
+	return masterPod, replicaPod, nil
+
+}
+
 var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempts(3), func() {
 	ctx := context.Background()
 	name := "race-test"
@@ -186,25 +207,13 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			// Wait for a replica pod to exist with role label assigned
 			// After previous test or between retries, pods may be reconciling
 			Eventually(func() bool {
-				var pods corev1.PodList
-				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-					resources.DragonflyNameLabelKey:    name,
-					resources.KubernetesPartOfLabelKey: "dragonfly",
-				})
-				if err != nil {
+				_, replica, err := getMasterReplica(ctx, namespace, name)
+				if err != nil || replica == nil {
 					return false
 				}
-
-				By(fmt.Sprintf("Found %d dragonfly pods", len(pods.Items)))
-				for i := range pods.Items {
-					role := pods.Items[i].Labels[resources.RoleLabelKey]
-					By(fmt.Sprintf("Pod %s has role=%s", pods.Items[i].Name, role))
-					if role == resources.Replica {
-						podToDelete = &pods.Items[i]
-						return true
-					}
-				}
-				return false
+				podToDelete = replica
+				By(fmt.Sprintf("Found replica pod: %s", replica.Name))
+				return true
 			}, 30*time.Second, 1*time.Second).Should(BeTrue(), "Should eventually have a replica pod with role label")
 
 			Expect(podToDelete).NotTo(BeNil(), "Should have found a replica pod to delete")
@@ -289,21 +298,8 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 
 		It("Should verify data integrity and replication after recovery", func() {
 			By("Step 1: Finding and deleting a replica pod to trigger recovery")
-			var pods corev1.PodList
-			err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-				resources.DragonflyNameLabelKey:    name,
-				resources.KubernetesPartOfLabelKey: "dragonfly",
-			})
+			_, replicaToDelete, err := getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
-
-			var replicaToDelete *corev1.Pod
-			for i := range pods.Items {
-				role := pods.Items[i].Labels[resources.RoleLabelKey]
-				if role == resources.Replica {
-					replicaToDelete = &pods.Items[i]
-					break
-				}
-			}
 			Expect(replicaToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
 
 			By(fmt.Sprintf("Deleting replica pod: %s", replicaToDelete.Name))
@@ -340,21 +336,8 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			}, 60*time.Second, 2*time.Second).Should(BeTrue(), "Should have all pods ready with roles after recovery")
 
 			By("Step 3: Finding the recovered replica pod")
-			err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-				resources.DragonflyNameLabelKey:    name,
-				resources.KubernetesPartOfLabelKey: "dragonfly",
-			})
+			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
-
-			var masterPod, replicaPod *corev1.Pod
-			for i := range pods.Items {
-				role := pods.Items[i].Labels[resources.RoleLabelKey]
-				if role == resources.Master {
-					masterPod = &pods.Items[i]
-				} else if role == resources.Replica {
-					replicaPod = &pods.Items[i]
-				}
-			}
 			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
 			Expect(replicaPod).NotTo(BeNil(), "Should have a replica pod")
 
@@ -366,7 +349,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 
 			By("Verifying original data is still present on master")
 			// Check key count using INFO keyspace
-			replicationCheckStartTime := time.Now()
 			masterKeyCount, err := getKeyCountFromInfo(ctx, rc)
 			Expect(err).To(BeNil())
 			By(fmt.Sprintf("Master has %d keys (expected %d)", masterKeyCount, expectedKeyCount))
@@ -435,19 +417,49 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 				),
 				ContainSubstring("master_link_status:up"),
 			), "Replica should connect to master within 60 seconds")
+		})
+
+		It("Should be able to insert new values into the stable master / replica that are present on replica", func() {
+			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
+			Expect(err).To(BeNil())
+			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
+			Expect(replicaPod).NotTo(BeNil(), "Should have a replica pod")
+
+			// Connect to replica
+			pfResult, err := setupPortForwardWithCleanup(ctx, clientset, cfg, replicaPod, resources.DragonflyPort, 30*time.Second)
+			Expect(err).To(BeNil())
+			defer pfResult.Cleanup()
+			replicaClient := redis.NewClient(&redis.Options{
+				Addr:         fmt.Sprintf("localhost:%d", pfResult.LocalPort),
+				DialTimeout:  15 * time.Second,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 10 * time.Second,
+				MaintNotificationsConfig: &maintnotifications.Config{
+					Mode: maintnotifications.ModeDisabled,
+				},
+			})
+			defer replicaClient.Close()
+
+			// Connect to master
+			stopChan := make(chan struct{}, 1)
+			masterClient, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, "", 6391)
+			Expect(err).To(BeNil())
+			defer close(stopChan)
+			defer masterClient.Close()
 
 			By("Writing new data to master to verify live replication")
 			testKey := fmt.Sprintf("post-recovery-key-%d", time.Now().Unix())
 			testValue := "post-recovery-value"
-			err = rc.Set(ctx, testKey, testValue, 0).Err()
+			err = masterClient.Set(ctx, testKey, testValue, 0).Err()
 			Expect(err).To(BeNil())
 
 			// Verify new data appears on replica (give replication a moment)
-			Eventually(replicaClient.Get(ctx, testKey), 5*time.Second, 500*time.Millisecond).Should(Equal(testValue), "New data should replicate to replica")
+			Eventually(func() (string, error) {
+				return replicaClient.Get(ctx, testKey).Result()
+			}, 5*time.Second, 500*time.Millisecond).Should(Equal(testValue), "New data should replicate to replica")
 
-			recoveryDuration := time.Since(replicationCheckStartTime)
 			By(fmt.Sprintf("✅ Data integrity and replication verified: %d keys on both master and replica, live replication working", expectedKeyCount))
-			By(fmt.Sprintf("⏱️  Total recovery and stabilization time: %.2f seconds", recoveryDuration.Seconds()))
+
 		})
 
 		It("Cleanup", func() {
