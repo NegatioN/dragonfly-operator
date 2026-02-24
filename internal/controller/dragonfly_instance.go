@@ -792,6 +792,31 @@ func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, err
 		return true, nil
 	}
 
+	// Protect while any replica pod has not finished syncing with the master.
+	// A replica that is ready and has a role but is still replicating is not
+	// a safe standby — evicting the master now would cause data loss or outage.
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if isTerminating(pod) {
+			continue
+		}
+		if pod.Labels[resources.RoleLabelKey] != resources.Replica {
+			continue
+		}
+		stable, err := dfi.isReplicaStable(ctx, pod)
+		if err != nil {
+			// Fail-closed: if we cannot confirm stability, keep protection on.
+			dfi.log.Info("PDB protection needed: could not verify replica stability",
+				"pod", pod.Name, "error", err)
+			return true, nil
+		}
+		if !stable {
+			dfi.log.Info("PDB protection needed: replica not yet stable",
+				"pod", pod.Name)
+			return true, nil
+		}
+	}
+
 	return false, nil
 }
 
@@ -810,7 +835,7 @@ func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) (bool, error) {
 
 	// Calculate desired MaxUnavailable:
 	// - Normal mode: 1 (allow one voluntary disruption)
-	// - Protection mode: 0 (no voluntary disruptions until 2+ pods have roles)
+	// - Protection mode: 0 (no voluntary disruptions until all replicas are stable)
 	desiredMaxUnavailable := int32(1)
 	if needsProtection {
 		desiredMaxUnavailable = 0

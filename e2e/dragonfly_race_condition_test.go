@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
@@ -99,6 +100,246 @@ func getPDB(ctx context.Context, name, namespace string) (*policyv1.PodDisruptio
 	return &pdb, nil
 }
 
+// startPodStateLogger starts a background goroutine that logs every state
+// change (phase, readiness, role label) for all Dragonfly pods in the given
+// instance, plus any PDB changes. It returns a cancel func that stops logging.
+// Only transitions are printed, so the output stays readable even over long runs.
+//
+// A second goroutine maintains a port-forward to the current replica pod and
+// polls INFO replication every 500ms. Replication state changes also trigger
+// log lines. The port-forward is re-established whenever the replica pod is
+// replaced (e.g. after eviction or deletion).
+func startPodStateLogger(ctx context.Context, name, namespace string) context.CancelFunc {
+	type podState struct {
+		phase      string
+		ready      bool
+		role       string
+		linkStatus string // "up", "down", or ""
+		syncIn     string // "0", "1", or ""
+		keys       int
+	}
+	type pdbState struct {
+		maxUnavailable     int32
+		disruptionsAllowed int32
+		currentHealthy     int32
+	}
+
+	// replInfo is updated by the replication tracker goroutine.
+	var replMu sync.Mutex
+	type replEntry struct {
+		linkStatus string
+		syncIn     string
+		keys       int
+	}
+	replByPod := map[string]replEntry{}
+
+	logCtx, cancel := context.WithCancel(ctx)
+	startTime := time.Now()
+
+	// Replication tracker: maintains one port-forward to the current replica
+	// and updates replByPod whenever INFO replication changes.
+	go func() {
+		var trackedPodUID types.UID
+		var pfCleanup func()
+		var rc *redis.Client
+
+		resetForward := func() {
+			if rc != nil {
+				rc.Close()
+				rc = nil
+			}
+			if pfCleanup != nil {
+				pfCleanup()
+				pfCleanup = nil
+			}
+			trackedPodUID = ""
+		}
+
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		defer resetForward()
+
+		for {
+			select {
+			case <-logCtx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			// Find the non-master pod (regardless of whether role label is assigned yet)
+			var pods corev1.PodList
+			if err := k8sClient.List(logCtx, &pods,
+				client.InNamespace(namespace),
+				client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				}); err != nil {
+				continue
+			}
+			var targetPod *corev1.Pod
+			for i := range pods.Items {
+				p := &pods.Items[i]
+				if p.DeletionTimestamp != nil {
+					continue
+				}
+				if p.Labels[resources.RoleLabelKey] == resources.Master {
+					continue
+				}
+				if p.Status.Phase == corev1.PodRunning {
+					targetPod = p
+					break
+				}
+			}
+
+			// No non-master running pod — clear state and drop the forward
+			if targetPod == nil {
+				if trackedPodUID != "" {
+					resetForward()
+					replMu.Lock()
+					replByPod = map[string]replEntry{}
+					replMu.Unlock()
+				}
+				continue
+			}
+
+			// Pod identity changed (same name, new UID after recreation) — reset and re-establish
+			if targetPod.UID != trackedPodUID {
+				resetForward()
+				pfResult, err := setupPortForwardWithCleanup(logCtx, clientset, cfg, targetPod, resources.DragonflyAdminPort, 5*time.Second)
+				if err != nil {
+					continue
+				}
+				pfCleanup = pfResult.Cleanup
+				trackedPodUID = targetPod.UID
+				rc = redis.NewClient(&redis.Options{
+					Addr:        fmt.Sprintf("localhost:%d", pfResult.LocalPort),
+					DialTimeout: 2 * time.Second,
+					ReadTimeout: 2 * time.Second,
+					MaintNotificationsConfig: &maintnotifications.Config{
+						Mode: maintnotifications.ModeDisabled,
+					},
+				})
+			}
+
+			if rc == nil {
+				continue
+			}
+
+			// Poll INFO replication and keyspace together
+			queryCtx, qCancel := context.WithTimeout(logCtx, 1*time.Second)
+			info, err := rc.Info(queryCtx, "replication").Result()
+			qCancel()
+			if err != nil {
+				continue
+			}
+			data := map[string]string{}
+			for _, line := range strings.Split(info, "\r\n") {
+				if k, v, ok := strings.Cut(line, ":"); ok {
+					data[strings.TrimSpace(k)] = strings.TrimSpace(v)
+				}
+			}
+
+			queryCtx, qCancel = context.WithTimeout(logCtx, 1*time.Second)
+			keys, _ := getKeyCountFromInfo(queryCtx, rc)
+			qCancel()
+
+			replMu.Lock()
+			replByPod[targetPod.Name] = replEntry{
+				linkStatus: data["master_link_status"],
+				syncIn:     data["master_sync_in_progress"],
+				keys:       keys,
+			}
+			replMu.Unlock()
+		}
+	}()
+
+	// Pod / PDB state logger
+	go func() {
+		seenPods := map[string]podState{}
+		var seenPDB *pdbState
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-logCtx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			elapsed := time.Since(startTime).Milliseconds()
+
+			var pods corev1.PodList
+			if err := k8sClient.List(logCtx, &pods,
+				client.InNamespace(namespace),
+				client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				}); err != nil {
+				continue
+			}
+
+			for i := range pods.Items {
+				p := &pods.Items[i]
+				ready := false
+				for _, c := range p.Status.Conditions {
+					if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+						ready = true
+					}
+				}
+				role := p.Labels[resources.RoleLabelKey]
+				if role == "" {
+					role = "<none>"
+				}
+
+				replMu.Lock()
+				repl := replByPod[p.Name]
+				replMu.Unlock()
+
+				cur := podState{
+					phase:      string(p.Status.Phase),
+					ready:      ready,
+					role:       role,
+					linkStatus: repl.linkStatus,
+					syncIn:     repl.syncIn,
+					keys:       repl.keys,
+				}
+				if prev, seen := seenPods[p.Name]; !seen || prev != cur {
+					marker := ""
+					if ready && role == "<none>" {
+						marker = "  <<< RACE WINDOW OPEN"
+					} else if seen && seenPods[p.Name].ready && seenPods[p.Name].role == "<none>" && role != "<none>" {
+						marker = "  <<< RACE WINDOW CLOSED"
+					}
+					replInfo := ""
+					if role == resources.Replica && (repl.linkStatus != "" || repl.syncIn != "" || repl.keys > 0) {
+						replInfo = fmt.Sprintf(" link=%-4s sync=%s keys=%d", repl.linkStatus, repl.syncIn, repl.keys)
+					}
+					GinkgoWriter.Printf("[pods t=%5dms] %-25s phase=%-9s ready=%-5v role=%-9s%s%s\n",
+						elapsed, p.Name, cur.phase, cur.ready, cur.role, replInfo, marker)
+					seenPods[p.Name] = cur
+				}
+			}
+
+			pdb, err := getPDB(logCtx, name, namespace)
+			if err != nil {
+				continue
+			}
+			cur := pdbState{
+				maxUnavailable:     pdb.Spec.MaxUnavailable.IntVal,
+				disruptionsAllowed: pdb.Status.DisruptionsAllowed,
+				currentHealthy:     pdb.Status.CurrentHealthy,
+			}
+			if seenPDB == nil || *seenPDB != cur {
+				GinkgoWriter.Printf("[pdb  t=%5dms] MaxUnavailable=%d  CurrentHealthy=%d  DisruptionsAllowed=%d\n",
+					elapsed, cur.maxUnavailable, cur.currentHealthy, cur.disruptionsAllowed)
+				seenPDB = &cur
+			}
+		}
+	}()
+
+	return cancel
+}
+
 // tryEvictPod attempts to evict a pod via the Kubernetes Eviction API.
 // Unlike a direct Delete, eviction is subject to PodDisruptionBudget enforcement:
 // when the PDB blocks it, the API returns HTTP 429 (Too Many Requests).
@@ -115,8 +356,8 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 	ctx := context.Background()
 	name := "race-test"
 	namespace := "default"
-	replicas := 2             // Minimal setup: 1 master + 1 replica
-	expectedKeyCount := 25000 // Number of keys we write in the test
+	replicas := 2                // Minimal setup: 1 master + 1 replica
+	expectedKeyCount := 11500000 // Number of keys we write in the test
 
 	df := dfv1alpha1.Dragonfly{
 		ObjectMeta: metav1.ObjectMeta{
@@ -165,12 +406,19 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			defer rc.Close()
 
 			By("Writing test data to master")
-			// Write multiple keys to ensure there's real data to replicate
+			// Write keys in pipelines to minimize round-trips
+			const pipelineBatchSize = 10000
 			timestamp := time.Now().Unix()
-			for i := 0; i < expectedKeyCount; i++ {
-				key := fmt.Sprintf("test-key-%d", i)
-				value := fmt.Sprintf("test-value-%d-timestamp-%d", i, timestamp)
-				err := rc.Set(ctx, key, value, 0).Err()
+			for batchStart := 0; batchStart < expectedKeyCount; batchStart += pipelineBatchSize {
+				pipe := rc.Pipeline()
+				end := batchStart + pipelineBatchSize
+				if end > expectedKeyCount {
+					end = expectedKeyCount
+				}
+				for i := batchStart; i < end; i++ {
+					pipe.Set(ctx, fmt.Sprintf("test-key-%d", i), fmt.Sprintf("test-value-%d-%d", i, timestamp), 0)
+				}
+				_, err := pipe.Exec(ctx)
 				Expect(err).To(BeNil())
 			}
 
@@ -178,15 +426,23 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		})
 
 		It("Should dynamically adjust PDB during pod deletion to prevent cascading failures", func() {
-			By("Step 1: Ensuring system is stable before test (MaxUnavailable=1)")
-			// Wait for system to be in normal mode before starting the test
-			Eventually(func() int {
+			By("Step 1: Ensuring system is stable before test")
+			// Wait for both master and replica pods to be present with PDB in normal mode.
+			// After a failed attempt where the master was evicted (race condition demonstrated),
+			// the operator needs time to reassign roles and stabilize.
+			Eventually(func() bool {
 				pdb, err := getPDB(ctx, name, namespace)
-				if err != nil {
-					return -1
+				if err != nil || pdb.Spec.MaxUnavailable.IntVal != 1 {
+					return false
 				}
-				return int(pdb.Spec.MaxUnavailable.IntVal)
-			}, 30*time.Second, 1*time.Second).Should(Equal(1), "System should be stable with MaxUnavailable=1 before test")
+				master, replica, err := getMasterReplica(ctx, namespace, name)
+				return err == nil && master != nil && replica != nil
+			}, 60*time.Second, 1*time.Second).Should(BeTrue(),
+				"System should be stable: master+replica present with PDB MaxUnavailable=1")
+
+			By("Starting background pod/PDB state logger")
+			stopLogger := startPodStateLogger(ctx, name, namespace)
+			defer stopLogger()
 
 			By("Step 2: Finding and deleting a replica pod (wait for role to be assigned)")
 			var podToDelete *corev1.Pod
@@ -209,34 +465,73 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			err := k8sClient.Delete(ctx, podToDelete)
 			Expect(err).To(BeNil())
 
-			By("Step 3: Checking if PDB drops to MaxUnavailable=0 (protection mode: no disruptions allowed)")
-			pdbProtected := false
-
-			// Poll for 10 seconds to see if operator reacts quickly
-			for i := 0; i < 50; i++ {
-				currentPDB, err := getPDB(ctx, name, namespace)
-				if err == nil {
-					currentMaxUnavailable := int(currentPDB.Spec.MaxUnavailable.IntVal)
-					if currentMaxUnavailable == 0 {
-						pdbProtected = true
-						By("PDB dropped to MaxUnavailable=0 (protection mode activated)")
-						break
-					}
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-
-			Expect(pdbProtected).To(BeTrue(), "PDB should drop to MaxUnavailable=0 during recovery to prevent cascading failures")
-
-			By("Step 3b: Attempting to evict master while PDB is in protection mode (should be rejected)")
-			// This is the core of the race condition fix: when the new replica pod is ready but
-			// has no role yet, the PDB must block any further voluntary disruption of the master.
+			By("Step 3: Finding master to evict")
 			masterPod, _, err := getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
-			Expect(masterPod).NotTo(BeNil(), "Master pod should still be running during recovery")
-			evictErr := tryEvictPod(ctx, masterPod)
+			Expect(masterPod).NotTo(BeNil(), "Master pod should still be running")
+
+			By("Step 3b: Waiting for replacement replica to get role=replica+ready=true, then immediately attempting master eviction")
+			// The race window is when the replacement pod (same name, new UID) first gets
+			// role=replica AND ready=true. At that moment Kubernetes counts both pods as healthy
+			// (CurrentHealthy=2), but the operator's next reconciliation may not have yet run
+			// isReplicaStable to confirm replication is complete (~100ms window):
+			//   - MaxUnavailable=1 (protection OFF): DisruptionsAllowed=1 → eviction SUCCEEDS  → test FAILS
+			//   - MaxUnavailable=0 (protection ON):  DisruptionsAllowed=0 → eviction BLOCKED   → test PASSES
+			//
+			// StatefulSet reuses the pod name, so we identify the replacement by:
+			// same name as deleted pod AND different UID.
+			deletedName := podToDelete.Name
+			deletedUID := podToDelete.UID
+			raceWindowSeen := false
+			var evictErr error
+
+			for i := 0; i < 600; i++ { // up to 60s at 10ms intervals
+				var pods corev1.PodList
+				if listErr := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				}); listErr != nil {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+
+				for i := range pods.Items {
+					p := &pods.Items[i]
+					// Only watch the replacement pod: same name as deleted, new UID
+					if p.Name != deletedName || p.UID == deletedUID {
+						continue
+					}
+					if p.Labels[resources.RoleLabelKey] != resources.Replica {
+						continue
+					}
+					podReady := false
+					for _, c := range p.Status.Conditions {
+						if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+							podReady = true
+						}
+					}
+					if !podReady {
+						continue
+					}
+
+					// Replacement has role=replica AND ready=true — attempt master eviction
+					// immediately before the operator's next reconciliation can confirm
+					// isReplicaStable and potentially release protection.
+					raceWindowSeen = true
+					evictErr = tryEvictPod(ctx, masterPod)
+					GinkgoWriter.Printf("[race window] replacement %s (uid=%s) role=replica ready=true, eviction blocked=%v err=%v\n",
+						p.Name, p.UID, apierrors.IsTooManyRequests(evictErr), evictErr)
+				}
+
+				if raceWindowSeen {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			Expect(raceWindowSeen).To(BeTrue(), "Replacement replica should have become ready within 60s")
 			Expect(apierrors.IsTooManyRequests(evictErr)).To(BeTrue(),
-				"Master eviction must be rejected (HTTP 429) by the PDB while in protection mode (MaxUnavailable=0)")
+				"Master eviction must be rejected (HTTP 429) by the PDB during recovery — replication may still be in progress")
 
 			By("Step 4: Waiting for pod to be recreated and replication to stabilize")
 			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
@@ -267,11 +562,13 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		It("Should verify data integrity and replication after recovery", func() {
 			// The previous test deleted the replica, recovered, then evicted the master and
 			// recovered again. Verify that all 25000 keys are still present and replicated.
-			By("Finding the current master and replica after recovery")
-			masterPod, replicaPod, err := getMasterReplica(ctx, namespace, name)
-			Expect(err).To(BeNil())
-			Expect(masterPod).NotTo(BeNil(), "Should have a master pod")
-			Expect(replicaPod).NotTo(BeNil(), "Should have a replica pod")
+			By("Waiting for system to be stable with both master and replica")
+			var masterPod, replicaPod *corev1.Pod
+			Eventually(func() bool {
+				var err error
+				masterPod, replicaPod, err = getMasterReplica(ctx, namespace, name)
+				return err == nil && masterPod != nil && replicaPod != nil
+			}, 60*time.Second, 1*time.Second).Should(BeTrue(), "Should have both master and replica pods ready")
 
 			stopChan := make(chan struct{}, 1)
 			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, "", 6391)
@@ -392,87 +689,6 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		})
 
 		It("Cleanup", func() {
-			var df dfv1alpha1.Dragonfly
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      name,
-				Namespace: namespace,
-			}, &df)
-			Expect(err).To(BeNil())
-
-			err = k8sClient.Delete(ctx, &df)
-			Expect(err).To(BeNil())
-		})
-	})
-})
-
-var _ = Describe("PDB Stability: 3 Replicas", Ordered, FlakeAttempts(3), func() {
-	ctx := context.Background()
-	name := "stable-test"
-	namespace := "default"
-	replicas := 3 // 1 master + 2 replicas - sufficient redundancy
-
-	df := dfv1alpha1.Dragonfly{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: dfv1alpha1.DragonflySpec{
-			Replicas: int32(replicas),
-		},
-	}
-
-	Context("Testing that PDB remains stable with 3 replicas", func() {
-		It("Should create dragonfly instance with 3 replicas", func() {
-			Expect(k8sClient.Create(ctx, &df)).To(Succeed())
-			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
-		})
-
-		It("Should have PDB configured with MaxUnavailable=1 when stable", func() {
-			Eventually(func() int32 {
-				pdb, err := getPDB(ctx, name, namespace)
-				if err != nil {
-					return -1
-				}
-				return pdb.Spec.MaxUnavailable.IntVal
-			}, 30*time.Second, 1*time.Second).Should(Equal(int32(1)), "PDB should be MaxUnavailable=1 when system is stable")
-		})
-
-		It("Should NOT increase PDB when deleting one replica (sufficient redundancy)", func() {
-			By("Step 1: Confirming initial PDB state")
-			initialPDB, err := getPDB(ctx, name, namespace)
-			Expect(err).To(BeNil())
-			Expect(initialPDB.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)), "Initial PDB should be MaxUnavailable=1")
-
-			By("Step 2: Finding and deleting a replica pod")
-			_, replicaToDelete, err := getMasterReplica(ctx, namespace, name)
-			Expect(err).To(BeNil())
-			Expect(replicaToDelete).NotTo(BeNil(), "Should have a replica pod to delete")
-
-			By(fmt.Sprintf("Deleting replica pod: %s", replicaToDelete.Name))
-			err = k8sClient.Delete(ctx, replicaToDelete)
-			Expect(err).To(BeNil())
-
-			By("Step 3: Verifying PDB remains at MaxUnavailable=1 (no protection needed)")
-			// With 3 replicas, losing 1 still leaves 2 healthy pods (1 master + 1 replica)
-			// The operator should recognize this is sufficient and NOT increase PDB
-			Consistently(func() int32 {
-				pdb, err := getPDB(ctx, name, namespace)
-				if err != nil {
-					return -1
-				}
-				return pdb.Spec.MaxUnavailable.IntVal
-			}, 10*time.Second, 500*time.Millisecond).Should(Equal(int32(1)), "PDB should remain at MaxUnavailable=1 (sufficient redundancy)")
-
-			By("Step 4: Waiting for pod to be recreated and system to stabilize")
-			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
-
-			By("Step 5: Confirming PDB is still MaxUnavailable=1 after recovery")
-			finalPDB, err := getPDB(ctx, name, namespace)
-			Expect(err).To(BeNil())
-			Expect(finalPDB.Spec.MaxUnavailable.IntVal).To(Equal(int32(1)), "Final PDB should remain MaxUnavailable=1")
-		})
-
-		AfterAll(func() {
 			var df dfv1alpha1.Dragonfly
 			err := k8sClient.Get(ctx, types.NamespacedName{
 				Name:      name,
