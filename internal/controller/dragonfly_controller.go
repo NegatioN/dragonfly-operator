@@ -69,13 +69,6 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile dragonfly resources: %w", err)
 	}
 
-	// Reconcile PDB to ensure protection during pod lifecycle changes
-	// This provides a safety net in case pod lifecycle events are delayed
-	if _, err = dfi.reconcilePDB(ctx); err != nil {
-		log.Error(err, "failed to reconcile PDB in main reconciler")
-		// Don't fail - PDB is defensive
-	}
-
 	dfiStatus := dfi.getStatus()
 
 	if dfiStatus.Phase == PhaseReady || dfiStatus.Phase == PhaseReadyOld {

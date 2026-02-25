@@ -37,6 +37,7 @@ type DfPodLifeCycleReconciler struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -69,17 +70,9 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(fmt.Errorf("failed to get dragonfly instance: %w", err))
 	}
 
-	podReady, readinessErr := dfi.isPodReady(ctx, &pod)
+	podReady, readinessErr := dfi.isPodContainerReady(ctx, &pod)
 	if readinessErr != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to verify pod readiness: %w", readinessErr)
-	}
-
-	// Reconcile PDB to adjust protection based on pod states
-	// This ensures PDB is updated whenever pod lifecycle events occur
-	needsProtection, pdbErr := dfi.reconcilePDB(ctx)
-	if pdbErr != nil {
-		log.Error(pdbErr, "failed to reconcile PDB during pod lifecycle event")
-		// Don't fail the reconciliation - PDB update is defensive, not critical
 	}
 
 	master, err := dfi.getMaster(ctx)
@@ -106,7 +99,7 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{}, fmt.Errorf("failed to configure replication: %w", err)
 			}
 			// re-evaluate readiness after replication changes.
-			podReady, readinessErr = dfi.isPodReady(ctx, &pod)
+			podReady, readinessErr = dfi.isPodContainerReady(ctx, &pod)
 			if readinessErr != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to verify pod readiness: %w", readinessErr)
 			}
@@ -142,10 +135,26 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
 	}
 
-	// If we're in protection mode, requeue quickly to check if we can exit protection mode
-	if needsProtection {
-		log.V(1).Info("requeuing to check PDB protection status", "after", "2s")
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	// Update the replication-stable readiness gate condition for this pod.
+	// For replicas, requeue until isReplicaStable confirms sync is complete — this is what
+	// keeps the pod Not-Ready (and thus not counted by the PDB) until data is fully synced.
+	switch pod.Labels[resources.RoleLabelKey] {
+	case resources.Master:
+		if err = dfi.setReplicationStableCondition(ctx, &pod, true); err != nil {
+			log.Error(err, "failed to set replication condition on master")
+		}
+	case resources.Replica:
+		stable, stableErr := dfi.isReplicaStable(ctx, &pod)
+		if stableErr != nil {
+			log.Error(stableErr, "failed to check replica stability, will retry")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if err = dfi.setReplicationStableCondition(ctx, &pod, stable); err != nil {
+			log.Error(err, "failed to set replication condition on replica")
+		}
+		if !stable {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 	}
 
 	return ctrl.Result{}, nil

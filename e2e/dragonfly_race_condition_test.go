@@ -352,7 +352,7 @@ func tryEvictPod(ctx context.Context, pod *corev1.Pod) error {
 	})
 }
 
-var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempts(3), func() {
+var _ = Describe("Replica Recovery: Readiness Gate Protects Master During Replication Sync", Ordered, FlakeAttempts(3), func() {
 	ctx := context.Background()
 	name := "race-test"
 	namespace := "default"
@@ -369,7 +369,7 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		},
 	}
 
-	Context("Testing race condition when pod is ready but lacks role", func() {
+	Context("Eviction protection during replica recovery", func() {
 		It("Should create Dragonfly with 2 replicas", func() {
 			err := k8sClient.Create(ctx, &df)
 			Expect(err).To(BeNil())
@@ -425,20 +425,14 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			By(fmt.Sprintf("Data successfully written: %d keys", expectedKeyCount))
 		})
 
-		It("Should dynamically adjust PDB during pod deletion to prevent cascading failures", func() {
+		It("Should block master eviction while replacement replica has role label but replication is not yet stable", func() {
 			By("Step 1: Ensuring system is stable before test")
-			// Wait for both master and replica pods to be present with PDB in normal mode.
-			// After a failed attempt where the master was evicted (race condition demonstrated),
-			// the operator needs time to reassign roles and stabilize.
+			// Wait for both master and replica pods to be K8s-Ready (readiness gate satisfied).
 			Eventually(func() bool {
-				pdb, err := getPDB(ctx, name, namespace)
-				if err != nil || pdb.Spec.MaxUnavailable.IntVal != 1 {
-					return false
-				}
 				master, replica, err := getMasterReplica(ctx, namespace, name)
 				return err == nil && master != nil && replica != nil
 			}, 60*time.Second, 1*time.Second).Should(BeTrue(),
-				"System should be stable: master+replica present with PDB MaxUnavailable=1")
+				"System should be stable: master+replica both K8s-Ready")
 
 			By("Starting background pod/PDB state logger")
 			stopLogger := startPodStateLogger(ctx, name, namespace)
@@ -470,13 +464,15 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			Expect(err).To(BeNil())
 			Expect(masterPod).NotTo(BeNil(), "Master pod should still be running")
 
-			By("Step 3b: Waiting for replacement replica to get role=replica+ready=true, then immediately attempting master eviction")
+			By("Step 3b: Detecting the recovery window — replica has role=replica but readiness gate is False (sync in progress) — attempting master eviction")
 			// The race window is when the replacement pod (same name, new UID) first gets
-			// role=replica AND ready=true. At that moment Kubernetes counts both pods as healthy
-			// (CurrentHealthy=2), but the operator's next reconciliation may not have yet run
-			// isReplicaStable to confirm replication is complete (~100ms window):
-			//   - MaxUnavailable=1 (protection OFF): DisruptionsAllowed=1 → eviction SUCCEEDS  → test FAILS
-			//   - MaxUnavailable=0 (protection ON):  DisruptionsAllowed=0 → eviction BLOCKED   → test PASSES
+			// role=replica but is NOT yet K8s-Ready (readiness gate condition is False because
+			// replication sync is still in progress). At that moment Kubernetes counts only
+			// the master as healthy (CurrentHealthy=1), so the PDB blocks eviction:
+			//   - MaxUnavailable=1, currentHealthy=1: DisruptionsAllowed=0 → eviction BLOCKED → test PASSES
+			//
+			// Without readiness gates (gate removed or always=true), currentHealthy would be 2
+			// at this point, DisruptionsAllowed=1 → eviction SUCCEEDS → test FAILS.
 			//
 			// StatefulSet reuses the pod name, so we identify the replacement by:
 			// same name as deleted pod AND different UID.
@@ -504,22 +500,24 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 					if p.Labels[resources.RoleLabelKey] != resources.Replica {
 						continue
 					}
+					// We want role=replica AND NOT yet K8s-Ready (readiness gate is False).
+					// This is the window where the pod is syncing: PDB should block eviction.
 					podReady := false
 					for _, c := range p.Status.Conditions {
 						if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
 							podReady = true
 						}
 					}
-					if !podReady {
+					if podReady {
 						continue
 					}
 
-					// Replacement has role=replica AND ready=true — attempt master eviction
-					// immediately before the operator's next reconciliation can confirm
-					// isReplicaStable and potentially release protection.
+					// Replacement has role=replica AND ready=false — attempt master eviction.
+					// The readiness gate keeps this pod out of the PDB's healthy count,
+					// so DisruptionsAllowed=0 and eviction must be rejected.
 					raceWindowSeen = true
 					evictErr = tryEvictPod(ctx, masterPod)
-					GinkgoWriter.Printf("[race window] replacement %s (uid=%s) role=replica ready=true, eviction blocked=%v err=%v\n",
+					GinkgoWriter.Printf("[race window] replacement %s (uid=%s) role=replica ready=false, eviction blocked=%v err=%v\n",
 						p.Name, p.UID, apierrors.IsTooManyRequests(evictErr), evictErr)
 				}
 
@@ -536,23 +534,20 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 			By("Step 4: Waiting for pod to be recreated and replication to stabilize")
 			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
 
-			By("Step 5: Verifying PDB returns to MaxUnavailable=1 (normal mode)")
-			Eventually(func() int {
-				finalPDB, err := getPDB(ctx, name, namespace)
-				if err != nil {
-					return -1
-				}
-				return int(finalPDB.Spec.MaxUnavailable.IntVal)
-			}, 30*time.Second, 2*time.Second).Should(Equal(1), "PDB should return to MaxUnavailable=1 after recovery")
+			By("Step 5: Verifying both pods are K8s-Ready (readiness gate satisfied, replication stable)")
+			Eventually(func() bool {
+				master, replica, err := getMasterReplica(ctx, namespace, name)
+				return err == nil && master != nil && replica != nil
+			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Both pods should be K8s-Ready after replication stabilises")
 
-			By("Step 6: Attempting to evict master after recovery (should now be allowed by PDB=1)")
+			By("Step 6: Attempting to evict master after recovery (should now be allowed)")
 			// Once the new replica has its role and is stable, MaxUnavailable=1 allows one voluntary
 			// disruption — proving the protection window has closed correctly.
 			masterPod, _, err = getMasterReplica(ctx, namespace, name)
 			Expect(err).To(BeNil())
 			Expect(masterPod).NotTo(BeNil(), "Master pod should exist after recovery")
 			Expect(tryEvictPod(ctx, masterPod)).To(Succeed(),
-				"Master eviction should be allowed when PDB is in normal mode (MaxUnavailable=1)")
+				"Master eviction should be allowed when replica's readiness gate is satisfied (replication stable)")
 
 			By("Step 7: Waiting for system to recover after master eviction")
 			Expect(waitForStatefulSetReady(ctx, k8sClient, name, namespace, 2*time.Minute)).To(Succeed())
@@ -560,8 +555,9 @@ var _ = Describe("Race Condition: Pod Ready Without Role", Ordered, FlakeAttempt
 		})
 
 		It("Should verify data integrity and replication after recovery", func() {
-			// The previous test deleted the replica, recovered, then evicted the master and
-			// recovered again. Verify that all 25000 keys are still present and replicated.
+			// The previous test deleted the replica, waited for recovery, then evicted the master
+			// and waited for the system to recover again. Verify that all test keys are still
+			// present on both master and replica.
 			By("Waiting for system to be stable with both master and replica")
 			var masterPod, replicaPod *corev1.Pod
 			Eventually(func() bool {

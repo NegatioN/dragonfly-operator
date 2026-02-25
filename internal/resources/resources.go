@@ -86,6 +86,9 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly, defaultDragonflyImage
 				},
 				Spec: corev1.PodSpec{
 					ImagePullSecrets: df.Spec.ImagePullSecrets,
+					ReadinessGates: []corev1.PodReadinessGate{
+						{ConditionType: ReplicationStableCondition},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:  DragonflyContainerName,

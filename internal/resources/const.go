@@ -16,7 +16,11 @@ limitations under the License.
 
 package resources
 
-import "fmt"
+import (
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+)
 
 const (
 	// DragonflyPortName is the name of the port on which the Dragonfly instance listens
@@ -94,6 +98,11 @@ const (
 	Master = "master"
 
 	Replica = "replica"
+
+	// ReplicationStableCondition is a custom Pod readiness gate condition set by the operator.
+	// A Pod is not considered K8s-Ready until this condition is True, preventing the PDB
+	// from counting a syncing replica as "available" for disruption budget purposes.
+	ReplicationStableCondition corev1.PodConditionType = "dragonflydb.io/replication-stable"
 )
 
 var DefaultDragonflyArgs = []string{

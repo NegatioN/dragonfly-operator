@@ -36,8 +36,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -485,6 +483,11 @@ func (dfi *DragonflyInstance) replicaOf(ctx context.Context, pod *corev1.Pod, ma
 		return fmt.Errorf("could not update replica metadata: %w", err)
 	}
 
+	// Mark pod as not-ready via the readiness gate until isReplicaStable confirms sync.
+	if err := dfi.setReplicationStableCondition(ctx, pod, false); err != nil {
+		dfi.log.Error(err, "failed to set replication condition on replica", "pod", pod.Name)
+	}
+
 	if wasMaster {
 		// Prevent clients from sending commands to this old master
 		dfi.disconnectClients(ctx, redisClient, pod)
@@ -537,10 +540,13 @@ func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Po
 		return err
 	}
 
+	// Master is always in a stable replication state (it IS the source of truth).
+	if err := dfi.setReplicationStableCondition(ctx, pod, true); err != nil {
+		dfi.log.Error(err, "failed to set replication condition on master", "pod", pod.Name)
+	}
+
 	return nil
 }
-
-// disconnectClients disconnects all non-replication clients from a pod.
 func (dfi *DragonflyInstance) disconnectClients(ctx context.Context, redisClient *redis.Client, pod *corev1.Pod) {
 	dfi.log.Info("disconnecting clients from replica", "pod", pod.Name)
 	clientList, err := redisClient.ClientList(ctx).Result()
@@ -756,131 +762,68 @@ func (dfi *DragonflyInstance) isPodReady(ctx context.Context, pod *corev1.Pod) (
 	return loaded, nil
 }
 
-// needsPDBProtection determines if the system needs PDB protection (MaxUnavailable=0).
-// Protection is needed when fewer than 2 pods are ready with an assigned role,
-// meaning we cannot afford any voluntary disruption without risking complete outage.
-func (dfi *DragonflyInstance) needsPDBProtection(ctx context.Context) (bool, error) {
-	pods, err := dfi.getPods(ctx)
-	if err != nil {
-		return false, fmt.Errorf("failed to get pods: %w", err)
-	}
-
-	expectedReplicas := int(dfi.df.Spec.Replicas)
-	readyWithRole := 0
-
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-
-		// Skip terminating pods
-		if isTerminating(pod) {
-			continue
-		}
-
-		// Only count pods that are running, ready, and have a role assigned
-		if isRunningAndReady(pod) {
-			if _, hasRole := pod.Labels[resources.RoleLabelKey]; hasRole {
-				readyWithRole++
-			}
-		}
-	}
-
-	// Protect when fewer than 2 pods are ready with a role: losing any further pod
-	// risks a complete outage.
-	if readyWithRole < 2 {
-		dfi.log.Info("PDB protection needed: insufficient redundancy",
-			"readyWithRole", readyWithRole, "expected", expectedReplicas)
-		return true, nil
-	}
-
-	// Protect while any replica pod has not finished syncing with the master.
-	// A replica that is ready and has a role but is still replicating is not
-	// a safe standby — evicting the master now would cause data loss or outage.
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if isTerminating(pod) {
-			continue
-		}
-		if pod.Labels[resources.RoleLabelKey] != resources.Replica {
-			continue
-		}
-		stable, err := dfi.isReplicaStable(ctx, pod)
-		if err != nil {
-			// Fail-closed: if we cannot confirm stability, keep protection on.
-			dfi.log.Info("PDB protection needed: could not verify replica stability",
-				"pod", pod.Name, "error", err)
-			return true, nil
-		}
-		if !stable {
-			dfi.log.Info("PDB protection needed: replica not yet stable",
-				"pod", pod.Name)
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// reconcilePDB updates the PodDisruptionBudget based on current pod states.
-// It returns true if protection mode is active (MaxUnavailable=0).
-func (dfi *DragonflyInstance) reconcilePDB(ctx context.Context) (bool, error) {
-	// Only manage PDB for multi-replica setups
-	if dfi.df.Spec.Replicas < 2 {
+// isPodContainerReady returns true if the dragonfly container's readiness probe has passed
+// and the dataset is loaded. Unlike isPodReady, this does not require the custom readiness
+// gate condition to be satisfied — it is used by the lifecycle controller which is
+// responsible for setting that condition.
+func (dfi *DragonflyInstance) isPodContainerReady(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	if isTerminating(pod) || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 		return false, nil
 	}
-
-	needsProtection, err := dfi.needsPDBProtection(ctx)
+	if !isDragonflyContainerReady(pod.Status.ContainerStatuses) {
+		return false, nil
+	}
+	loaded, err := dfi.isDatasetLoaded(ctx, pod)
 	if err != nil {
-		return false, fmt.Errorf("failed to determine PDB protection needs: %w", err)
+		return false, fmt.Errorf("failed to determine dataset load status: %w", err)
+	}
+	return loaded, nil
+}
+
+// setReplicationStableCondition patches the Pod's status to set the custom readiness gate
+// condition. Setting stable=false marks the pod as not K8s-Ready (preventing the PDB from
+// counting it as available). Setting stable=true allows the pod to become K8s-Ready.
+func (dfi *DragonflyInstance) setReplicationStableCondition(ctx context.Context, pod *corev1.Pod, stable bool) error {
+	condStatus := corev1.ConditionFalse
+	reason := "ReplicationSyncing"
+	message := "Replica is syncing with the master"
+	if stable {
+		condStatus = corev1.ConditionTrue
+		reason = "ReplicationStable"
+		message = "Replication is stable"
 	}
 
-	// Calculate desired MaxUnavailable:
-	// - Normal mode: 1 (allow one voluntary disruption)
-	// - Protection mode: 0 (no voluntary disruptions until all replicas are stable)
-	desiredMaxUnavailable := int32(1)
-	if needsProtection {
-		desiredMaxUnavailable = 0
-	}
-
-	// Get current PDB
-	var pdb policyv1.PodDisruptionBudget
-	err = dfi.client.Get(ctx, types.NamespacedName{
-		Name:      dfi.df.Name,
-		Namespace: dfi.df.Namespace,
-	}, &pdb)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// PDB doesn't exist yet, it will be created by reconcileResources
-			return needsProtection, nil
+	// Skip patch if already at the desired state
+	for _, c := range pod.Status.Conditions {
+		if c.Type == resources.ReplicationStableCondition && c.Status == condStatus {
+			return nil
 		}
-		return false, fmt.Errorf("failed to get PDB: %w", err)
 	}
 
-	// Initialise MaxUnavailable if nil (e.g. PDB was created with MinAvailable or externally modified)
-	if pdb.Spec.MaxUnavailable == nil {
-		pdb.Spec.MaxUnavailable = &intstr.IntOrString{}
+	original := pod.DeepCopy()
+	now := metav1.Now()
+	found := false
+	for i, c := range pod.Status.Conditions {
+		if c.Type == resources.ReplicationStableCondition {
+			pod.Status.Conditions[i].Status = condStatus
+			pod.Status.Conditions[i].LastTransitionTime = now
+			pod.Status.Conditions[i].Reason = reason
+			pod.Status.Conditions[i].Message = message
+			found = true
+			break
+		}
+	}
+	if !found {
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type:               resources.ReplicationStableCondition,
+			Status:             condStatus,
+			LastTransitionTime: now,
+			Reason:             reason,
+			Message:            message,
+		})
 	}
 
-	// Check if update is needed
-	currentMaxUnavailable := pdb.Spec.MaxUnavailable.IntVal
-	if currentMaxUnavailable == desiredMaxUnavailable {
-		return needsProtection, nil // Already at desired value
-	}
-
-	// Update PDB
-	pdb.Spec.MaxUnavailable.IntVal = desiredMaxUnavailable
-	if err = dfi.client.Update(ctx, &pdb); err != nil {
-		return false, fmt.Errorf("failed to update PDB: %w", err)
-	}
-
-	mode := "normal"
-	if needsProtection {
-		mode = "protection"
-	}
-	dfi.log.Info("updated PDB", "from", currentMaxUnavailable, "to", desiredMaxUnavailable, "mode", mode)
-	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "PDBUpdate",
-		fmt.Sprintf("Updated PDB to MaxUnavailable=%d (%s mode)", desiredMaxUnavailable, mode))
-
-	return needsProtection, nil
+	return dfi.client.Status().Patch(ctx, pod, client.MergeFrom(original))
 }
 
 // detectRollingUpdate checks whether the pod spec has changed and performs a rolling update if needed
